@@ -459,6 +459,14 @@
 
             function __call_hats(hat, opts)
                 hat = tostring(hat)
+                
+                -- Helper to safely get length of either table or userdata array
+                local function safe_len(arr)
+                    if arr == nil then return 0 end
+                    local ok, len = pcall(function() return #arr end)
+                    return ok and len or 0
+                end
+                
                 local ok, snapshot_or_err = pcall(function()
                     local list = __luaHatRegistry[hat] or {}
                     local snapshot = {}
@@ -479,13 +487,16 @@
                 end
 
                 local snapshot = snapshot_or_err
-                if #snapshot == 0 then return end
+                if #snapshot == 0 then
+                    return
+                end
 
                 local function safe_call(entry, opts)
                     local fn = entry.fn
                     if entry.matchers and type(entry.matchers) == 'table' then
-                        -- Prefer strict positional matching if _args available
-                        if type(opts) == 'table' and type(opts._args) == 'table' and #opts._args >= #entry.matchers then
+                        local args_len = (opts and opts._args) and safe_len(opts._args) or 0
+                        -- Prefer strict positional matching if _args available (handle both table and userdata)
+                        if opts ~= nil and opts._args ~= nil and args_len >= #entry.matchers then
                             for i = 1, #entry.matchers do
                                 local m = entry.matchers[i]
                                 local a = opts._args[i]
@@ -499,7 +510,7 @@
                                     end
                                 end
                             end
-                        elseif type(opts) == 'table' and opts.key ~= nil and #entry.matchers == 1 then
+                        elseif opts ~= nil and opts.key ~= nil and #entry.matchers == 1 then
                             -- common case: key-pressed hat provides \`key\` field
                             local m = entry.matchers[1]
                             if type(opts.key) == 'string' and type(m) == 'string' then
@@ -516,6 +527,8 @@
                             end
                         end
                     end
+
+                    -- If we reach here, the handler matched; call it
                     if type(xpcall) == 'function' and type(debug) == 'table' and type(debug.traceback) == 'function' then
                         local ok2, err = xpcall(function() return fn(opts) end, function(e) return debug.traceback(tostring(e)) end)
                         if not ok2 and type(js_print) == 'function' then js_print('lua hat error: '..tostring(err)) end
@@ -856,6 +869,24 @@
                 // fall back to injecting a Lua literal for the full sanitized options.
                 let setRes;
                 const toSet = luaOpts == null ? sanitizedOpts || {} : luaOpts;
+
+                // Ensure positional args and key are present for Lua matcher logic.
+                try {
+                    if (!toSet._args || !Array.isArray(toSet._args)) {
+                        if (sanitizedOpts && Array.isArray(sanitizedOpts._args)) toSet._args = sanitizedOpts._args.slice();
+                        else toSet._args = [];
+                    } else {
+                        // Fill null/undefined slots from sanitizedOpts._args if available
+                        if (sanitizedOpts && Array.isArray(sanitizedOpts._args)) {
+                            for (let i = 0; i < sanitizedOpts._args.length; i++) {
+                                if (toSet._args[i] == null) toSet._args[i] = sanitizedOpts._args[i];
+                            }
+                        }
+                    }
+                    if ((toSet.key === undefined || toSet.key === null) && sanitizedOpts && sanitizedOpts.key) {
+                        toSet.key = sanitizedOpts.key;
+                    }
+                } catch (_) {}
                 try {
                     if (info && info.canSetGlobal === false) {
                         throw new Error("engine cannot set globals");
@@ -958,9 +989,6 @@
     }
 
     function scheduleDispatch(runtime, hatOpcode, util, options) {
-        if (String(hatOpcode) === 'event_whenkeypressed') {
-            try { console.error('[luaEngine] scheduleDispatch debug entry', { hatOpcode, util, options }); } catch (_) {}
-        }
         let resolvedTargets = [];
 
         function buildHatOptions(hat, utilObj, opts) {
@@ -1035,6 +1063,17 @@
                 if ((!out._args || out._args.length === 0) && Array.isArray(utilObj && utilObj.args)) {
                     out._args = utilObj.args.slice();
                 }
+
+                // Ensure positional args from utilObj.args fill missing slots
+                // even when out._args already has the correct length but contains nulls.
+                if (utilObj && Array.isArray(utilObj.args) && Array.isArray(out._args)) {
+                    for (let i = 0; i < utilObj.args.length; i++) {
+                        if (out._args[i] == null) {
+                            out._args[i] = utilObj.args[i];
+                            if (argNames[i]) out[argNames[i]] = utilObj.args[i];
+                        }
+                    }
+                }
             } catch (_) {}
             return out;
         }
@@ -1095,11 +1134,6 @@
                                 const info2 = luaEngines.get(tid);
                                 if (info2) {
                                     const constructed = buildHatOptions(hatOpcode, util, options);
-                                    if (String(hatOpcode) === 'event_whenkeypressed') {
-                                        try {
-                                            console.error('[luaEngine] debug dispatch', { hatOpcode, tid, util, constructed });
-                                        } catch (_) {}
-                                    }
                                     dispatchToEngine(info2, hatOpcode, constructed, t);
                                 }
                             }, 150);
