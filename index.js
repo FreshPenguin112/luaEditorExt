@@ -355,6 +355,21 @@
     async function sleep(ms) {
         return new Promise((r) => setTimeout(r, ms));
     }
+    // run a JS callback every animation frame (returns a cancel function)
+    window.forever = window.forever || function (fn) {
+        if (typeof fn !== 'function') return () => {};
+        let cancelled = false;
+        function step() {
+            try { fn(); } catch (e) { console.error('forever function error:', e); }
+            if (!cancelled) {
+                if (typeof window.requestAnimationFrame === 'function') window.requestAnimationFrame(step);
+                else setTimeout(step, 16);
+            }
+        }
+        if (typeof window.requestAnimationFrame === 'function') window.requestAnimationFrame(step);
+        else setTimeout(step, 16);
+        return () => { cancelled = true; };
+    };
     async function callOpcode(opcode, args, target) {
         const fn = window.vm?.runtime?.getOpcodeFunction?.(opcode);
         if (!fn) throw new Error("Opcode not found: " + opcode);
@@ -367,200 +382,38 @@
         const tid = target.id ?? target.spriteId ?? String(target);
         if (luaEngines.has(tid)) return luaEngines.get(tid);
 
-        const factory = await getWasmoonFactory();
-        const engine = await (factory.createEngine?.() || factory);
+        let engine = null;
+        let __localEngineStopping = false;
 
-            await engine.global.set("js_print", (s) => console.log(`[lua:${tid}]`, s));
-        await engine.global.set("sleep", (ms) => sleep(Number(ms || 0)));
-        await engine.global.set("call", async (opcode, args) =>
-            callOpcode(opcode, args || {}, target)
-        );
-        await engine.global.set("keyDown", (key) => vm.runtime.ioDevices.keyboard.getKeyIsDown(key));
-        await engine.global.set("keyHit", (key) => vm.runtime.ioDevices.keyboard.getKeyIsHit(key));
+        // Initialize Wasmoon engine in-process (cooperative yielding)
         try {
-            await engine.global.set("__register_hat_in_js", (hat, delta) => {
-                try {
-                    window.luaEngine &&
-                        window.luaEngine._registerHatForEngine &&
-                        window.luaEngine._registerHatForEngine(tid, hat, delta);
-                } catch (_) {}
+            const factory = await getWasmoonFactory();
+            engine = await (factory.createEngine?.() || factory);
+            await engine.global.set('js_print', (s) => { try { console.log(`[lua:${tid}]`, s); } catch (_) {} });
+            await engine.global.set('isStopping', () => __localEngineStopping);
+            await engine.global.set('sleep', (ms) => new Promise((resolve, reject) => { setTimeout(() => { try { if (__localEngineStopping) { reject('stopped'); } else { resolve(); } } catch (e) { reject(e); } }, Number(ms || 0)); }));
+            await engine.global.set('call', async (opcode, args) => callOpcode(opcode, args || {}, target));
+            await engine.global.set('keyDown', (k) => vm.runtime.ioDevices.keyboard.getKeyIsDown(k));
+            await engine.global.set('keyHit', (k) => vm.runtime.ioDevices.keyboard.getKeyIsHit(k));
+            await engine.global.set('__register_hat_in_js', (hat, delta) => { try { window.luaEngine && window.luaEngine._registerHatForEngine && window.luaEngine._registerHatForEngine(tid, hat, delta); } catch (_) {} });
+            await engine.global.set('frame', () => new Promise((resolve) => { try { if (typeof window.requestAnimationFrame === 'function') window.requestAnimationFrame(() => resolve(true)); else setTimeout(() => resolve(true), 16); } catch (_) { setTimeout(() => resolve(true), 16); } }));
+            await engine.global.set('_js_forever', (luaFn) => {
+                let stopped = false;
+                const cancel = window.forever(() => {
+                    if (stopped) return;
+                    try {
+                        if (typeof luaFn === 'function') luaFn();
+                    } catch (e) {
+                        console.error('forever callback error:', e);
+                    }
+                });
+                return { _cancel: cancel, _stop: () => { stopped = true; cancel(); } };
             });
-        } catch (_) {}
-
-        await engine.doString(`
-      function lua_table_from_js(tbl)
-        if type(tbl) ~= 'table' then return tbl end
-        local out = {}
-        for k,v in pairs(tbl) do
-          if type(v) == 'table' then out[k] = lua_table_from_js(v) else out[k] = v end
-        end
-        return out
-      end
-    `);
-
-                await engine.doString(`
-            __luaHatRegistry = __luaHatRegistry or {}
-            __luaHatNextId = __luaHatNextId or 0
-
-            local function deep_contains_value(tbl, val, seen)
-                if seen == nil then seen = {} end
-                if type(tbl) ~= 'table' then return tbl == val end
-                if seen[tbl] then return false end
-                seen[tbl] = true
-                for k, v in pairs(tbl) do
-                    if type(v) == 'table' then
-                        if deep_contains_value(v, val, seen) then return true end
-                    else
-                        if v == val then return true end
-                    end
-                end
-                return false
-            end
-
-            function on(hat, ...)
-                if type(hat) ~= 'string' and type(hat) ~= 'number' then
-                    if type(js_print) == 'function' then js_print('lua on() expected hat string/number, got '..tostring(type(hat))) end
-                    return function() end
-                end
-                local args = {...}
-                if #args == 0 then
-                    if type(js_print) == 'function' then js_print('lua on() expected function as last argument') end
-                    return function() end
-                end
-                local last = args[#args]
-                if type(last) ~= 'function' then
-                    if type(js_print) == 'function' then js_print('lua on() expected function as last argument, got '..tostring(type(last))) end
-                    return function() end
-                end
-                local fn = last
-                local matchers = nil
-                if #args > 1 then
-                    matchers = {}
-                    for i = 1, #args - 1 do table.insert(matchers, args[i]) end
-                end
-
-                hat = tostring(hat)
-                __luaHatRegistry[hat] = __luaHatRegistry[hat] or {}
-                __luaHatNextId = (__luaHatNextId or 0) + 1
-                local id = tostring(__luaHatNextId)
-                table.insert(__luaHatRegistry[hat], { id = id, fn = fn, matchers = matchers })
-                if type(__register_hat_in_js) == 'function' then pcall(__register_hat_in_js, hat, 1) end
-
-                return function()
-                    local list = __luaHatRegistry[hat] or {}
-                    for i = #list, 1, -1 do
-                        local entry = list[i]
-                        if type(entry) == 'table' and tostring(entry.id) == id then
-                            table.remove(list, i)
-                            if type(__register_hat_in_js) == 'function' then pcall(__register_hat_in_js, hat, -1) end
-                        end
-                    end
-                end
-            end
-
-            function __call_hats(hat, opts)
-                hat = tostring(hat)
-                
-                -- Helper to safely get length of either table or userdata array
-                local function safe_len(arr)
-                    if arr == nil then return 0 end
-                    local ok, len = pcall(function() return #arr end)
-                    return ok and len or 0
-                end
-                
-                local ok, snapshot_or_err = pcall(function()
-                    local list = __luaHatRegistry[hat] or {}
-                    local snapshot = {}
-                    for i = 1, #list do
-                        local entry = list[i]
-                        if type(entry) == 'table' and type(entry.fn) == 'function' then
-                            table.insert(snapshot, entry)
-                        elseif type(entry) == 'function' then
-                            table.insert(snapshot, { fn = entry })
-                        end
-                    end
-                    return snapshot
-                end)
-
-                if not ok then
-                    if type(js_print) == 'function' then js_print('lua __call_hats snapshot failed: '..tostring(snapshot_or_err)) end
-                    return
-                end
-
-                local snapshot = snapshot_or_err
-                if #snapshot == 0 then
-                    return
-                end
-
-                local function safe_call(entry, opts)
-                    local fn = entry.fn
-                    if entry.matchers and type(entry.matchers) == 'table' then
-                        local args_len = (opts and opts._args) and safe_len(opts._args) or 0
-                        -- Prefer strict positional matching if _args available (handle both table and userdata)
-                        if opts ~= nil and opts._args ~= nil and args_len >= #entry.matchers then
-                            for i = 1, #entry.matchers do
-                                local m = entry.matchers[i]
-                                local a = opts._args[i]
-                                if m == nil then
-                                    -- nil matcher always matches
-                                else
-                                    if type(a) == 'string' and type(m) == 'string' then
-                                        if string.lower(a) ~= string.lower(m) then return end
-                                    else
-                                        if tostring(a) ~= tostring(m) then return end
-                                    end
-                                end
-                            end
-                        elseif opts ~= nil and opts.key ~= nil and #entry.matchers == 1 then
-                            -- common case: key-pressed hat provides \`key\` field
-                            local m = entry.matchers[1]
-                            if type(opts.key) == 'string' and type(m) == 'string' then
-                                if string.lower(opts.key) ~= string.lower(m) then return end
-                            else
-                                if tostring(opts.key) ~= tostring(m) then return end
-                            end
-                        else
-                            for i = 1, #entry.matchers do
-                                local m = entry.matchers[i]
-                                if not deep_contains_value(opts, m) then
-                                    return -- skip this handler
-                                end
-                            end
-                        end
-                    end
-
-                    -- If we reach here, the handler matched; call it
-                    if type(xpcall) == 'function' and type(debug) == 'table' and type(debug.traceback) == 'function' then
-                        local ok2, err = xpcall(function() return fn(opts) end, function(e) return debug.traceback(tostring(e)) end)
-                        if not ok2 and type(js_print) == 'function' then js_print('lua hat error: '..tostring(err)) end
-                    else
-                        local ok2, err = pcall(fn, opts)
-                        if not ok2 and type(js_print) == 'function' then js_print('lua hat error: '..tostring(err)) end
-                    end
-                end
-
-                for i = 1, #snapshot do
-                    pcall(safe_call, snapshot[i], opts)
-                end
-            end
-
-            function __dump_registry_types()
-                local out = {}
-                for k, v in pairs(__luaHatRegistry or {}) do
-                    for i = 1, #v do
-                        local entry = v[i]
-                        if type(entry) == 'table' then
-                            table.insert(out, tostring(k)..":"..tostring(i)..":table(id="..tostring(entry.id)..",fn="..tostring(type(entry.fn))..")")
-                        else
-                            table.insert(out, tostring(k)..":"..tostring(i)..":"..tostring(type(entry)))
-                        end
-                    end
-                end
-                return table.concat(out, ",")
-            end
-        `);
-
-        await engine.doString(`function print(s) js_print(s) end`);
+            await engine.doString("function lua_table_from_js(tbl) if type(tbl) ~= 'table' then return tbl end local out = {} for k,v in pairs(tbl) do if type(v) == 'table' then out[k] = lua_table_from_js(v) else out[k] = v end end return out end");
+            try { await engine.doString("function forever(fn) if type(fn) ~= 'function' then return end _js_forever(fn) end"); } catch (_) {}
+        } catch (e) {
+            console.error('[luaEngine] failed to init in-process engine for', tid, e);
+        }
 
         if (loadedBlocksFull) {
             try {
@@ -597,7 +450,17 @@
             canSetGlobal = false;
         }
 
-        const info = { engine, target, async: isAsync, canSetGlobal };
+        const info = {
+            engine,
+            target,
+            async: isAsync,
+            canSetGlobal,
+            _setStopping: () => {
+                try {
+                    __localEngineStopping = true;
+                } catch (_) {}
+            },
+        };
         luaEngines.set(tid, info);
         return info;
     }
@@ -605,7 +468,6 @@
     // loadStdlibOnce removed (not used)
 
     async function injectOpcodeWrappersIntoLua(infoOrEngine, blocksMap) {
-        const engine = infoOrEngine.engine || infoOrEngine;
         function sanitizeLuaName(s) {
             const keywords = new Set([
                 "and",
@@ -674,6 +536,7 @@
         }
 
         try {
+            const engine = infoOrEngine.engine || infoOrEngine;
             await engine.doString(src);
         } catch (e) {
             console.error("injectOpcodeWrappersIntoLua failed:", e);
@@ -699,9 +562,15 @@
         if (!code) return;
         storageSet("lua", code, tid);
         try {
-            await engine.doString(code);
+            if (engine && typeof engine.doString === 'function') {
+                try {
+                    await engine.doString(code);
+                } catch (e) {
+                    console.error(`[luaEngine:${tid}] runtime error:`, e);
+                }
+            }
         } catch (e) {
-                console.error(`[luaEngine:${tid}] runtime error:`, e);
+            console.error(`[luaEngine:${tid}] runtime error:`, e);
         }
         try {
             const info = luaEngines.get(tid);
@@ -888,6 +757,8 @@
                         toSet.key = sanitizedOpts.key;
                     }
                 } catch (_) {}
+
+                // If engine is worker-hosted, just post a callHat message and return early
                 try {
                     if (info && info.canSetGlobal === false) {
                         throw new Error("engine cannot set globals");
@@ -1201,18 +1072,31 @@
                 try {
                     for (const [tid, info] of luaEngines) {
                         try {
-                                if (info && info.engine) {
-                                    try {
-                                        const p = info.engine.doString('__luaHatRegistry = {}');
+                            if (info) {
+                                try {
+                                    if (info.engine && info.engine.doString) {
+                                        const p = info.engine.doString && info.engine.doString('__luaHatRegistry = {}');
                                         if (p && typeof p.catch === 'function') p.catch(() => {});
-                                    } catch (_) {}
-                                }
+                                    }
+                                } catch (_) {}
+                                try {
+                                    try { info._setStopping && info._setStopping(); } catch (_) {}
+                                    if (typeof info.engine.close === 'function') {
+                                        const res = info.engine.close();
+                                        if (res && typeof res.then === 'function') await res.catch(() => {});
+                                    } else if (typeof info.engine.terminate === 'function') {
+                                        const res = info.engine.terminate();
+                                        if (res && typeof res.then === 'function') await res.catch(() => {});
+                                    }
+                                } catch (_) {}
+                            }
                         } catch (_) {}
                         try { queuedHats.delete(tid); } catch (_) {}
                     }
                     try {
+                        try { queuedHats.clear(); } catch (_) {}
+                        try { luaEngines.clear(); } catch (_) {}
                         if (window.luaEngine) {
-                            try { queuedHats.clear(); } catch (_) {}
                             try { window.luaEngine._hatIndex = new Map(); } catch (_) {}
                         }
                     } catch (_) {}
@@ -1221,7 +1105,7 @@
                     console.error("PROJECT_STOP_ALL handler error:", e);
                 }
             };
-                    window.vm.runtime.on('PROJECT_STOP_ALL', stopHandler);
+            window.vm.runtime.on('PROJECT_STOP_ALL', stopHandler);
         } catch (_) {}
     } else {
         (function pollRuntime() {
@@ -1234,35 +1118,45 @@
                     clearInterval(poll);
                     window.vm.runtime.on("PROJECT_START", onProjectStart);
                     // also register stop handler when runtime becomes available
-                    try {
-                        const stopHandler = async () => {
+                        try {
+                            const stopHandler = async () => {
                                 try {
-                                for (const [tid, info] of luaEngines) {
+                                    for (const [tid, info] of luaEngines) {
+                                        try {
+                                            if (info) {
+                                                try {
+                                                    if (info.engine && info.engine.doString) {
+                                                        const p = info.engine.doString && info.engine.doString('__luaHatRegistry = {}');
+                                                        if (p && typeof p.catch === 'function') p.catch(() => {});
+                                                    }
+                                                } catch (_) {}
+                                                try {
+                                                    if (typeof info.engine.close === 'function') {
+                                                        const res = info.engine.close();
+                                                        if (res && typeof res.then === 'function') await res.catch(() => {});
+                                                    } else if (typeof info.engine.terminate === 'function') {
+                                                        const res = info.engine.terminate();
+                                                        if (res && typeof res.then === 'function') await res.catch(() => {});
+                                                    }
+                                                } catch (_) {}
+                                            }
+                                        } catch (_) {}
+                                        try { queuedHats.delete(tid); } catch (_) {}
+                                    }
                                     try {
-                                        if (info && info.engine) {
-                                            try {
-                                                const p = info.engine.doString('__luaHatRegistry = {}');
-                                                if (p && typeof p.catch === 'function') p.catch(() => {});
-                                            } catch (_) {}
+                                        try { queuedHats.clear(); } catch (_) {}
+                                        try { luaEngines.clear(); } catch (_) {}
+                                        if (window.luaEngine) {
+                                            try { window.luaEngine._hatIndex = new Map(); } catch (_) {}
                                         }
                                     } catch (_) {}
-                                    try { queuedHats.clear(); } catch (_) {}
+                                    // PROJECT_STOP_ALL cleanup finished
+                                } catch (e) {
+                                    console.error("PROJECT_STOP_ALL handler error:", e);
                                 }
-                                try {
-                                    const map = window.luaEngine && window.luaEngine._hatIndex;
-                                    if (map && map instanceof Map) {
-                                        for (const [hat, m] of map) {
-                                                    try {} catch (_) {}
-                                        }
-                                    }
-                                } catch (_) {}
-                                // PROJECT_STOP_ALL cleanup finished
-                            } catch (e) {
-                                console.error("PROJECT_STOP_ALL handler error:", e);
-                            }
-                        };
-                        window.vm.runtime.on('PROJECT_STOP_ALL', stopHandler);
-                    } catch (_) {}
+                            };
+                            window.vm.runtime.on('PROJECT_STOP_ALL', stopHandler);
+                        } catch (_) {}
                 } else if (Date.now() - start > 60000) clearInterval(poll);
             }, 500);
         })();
@@ -1323,16 +1217,17 @@
 
     async function syncEngineHatIndex(info) {
         try {
-            if (!info || !info.engine) return;
+            if (!info) return;
             const tid =
                 info.target && (info.target.id ?? info.target.spriteId)
                     ? info.target.id ?? info.target.spriteId
                     : "no_target";
-            const engine = info.engine;
             let res = null;
             try {
                 const code = `local out={}; for k,v in pairs(__luaHatRegistry or {}) do out[k]=#v end; return out`;
-                res = await engine.doString(code);
+                if (info.engine && typeof info.engine.doString === 'function') {
+                    res = await info.engine.doString(code);
+                }
             } catch (e) {
                 res = null;
             }
@@ -1388,12 +1283,14 @@
     window.luaEngine.dumpRegistries = async function () {
         try {
             for (const [tid, info] of luaEngines) {
-                    try {
-                    const engine = info.engine;
-                    const dump = await engine.doString(
-                        "return __dump_registry_types()"
-                    );
-                    // registry_types dump collected (ignored)
+                try {
+                    if (info.engine && typeof info.engine.doString === 'function') {
+                        try {
+                            const dump = await info.engine.doString("return __dump_registry_types()");
+                        } catch (e) {
+                            console.error("[luaEngine] registry_types failed for", tid, e);
+                        }
+                    }
                 } catch (e) {
                     console.error("[luaEngine] registry_types failed for", tid, e);
                 }
@@ -1416,16 +1313,52 @@
         }
     };
 
+    // terminateAll: signal stopping to all engines and terminate workers / close engines
+    window.luaEngine.terminateAll = async function () {
+        try {
+            for (const [tid, info] of luaEngines) {
+                try {
+                    if (info) {
+                        try { info._setStopping && info._setStopping(); } catch (_) {}
+                        if (info.engine) {
+                            try {
+                                if (typeof info.engine.close === 'function') {
+                                    const res = info.engine.close();
+                                    if (res && typeof res.then === 'function') await res.catch(() => {});
+                                } else if (typeof info.engine.terminate === 'function') {
+                                    const res = info.engine.terminate();
+                                    if (res && typeof res.then === 'function') await res.catch(() => {});
+                                }
+                            } catch (_) {}
+                        }
+                    }
+                } catch (_) {}
+                try { queuedHats.delete(tid); } catch (_) {}
+            }
+            try { queuedHats.clear(); } catch (_) {}
+            try { luaEngines.clear(); } catch (_) {}
+            if (window.luaEngine) {
+                try { window.luaEngine._hatIndex = new Map(); } catch (_) {}
+            }
+            return true;
+        } catch (e) {
+            console.error("[luaEngine] terminateAll error:", e);
+            return false;
+        }
+    };
+
     window.luaEngine.callHatOnEngine = async function (tid, hat) {
         try {
             const info = luaEngines.get(tid);
             if (!info) return;
-            const engine = info.engine;
             try {
-                const res = await engine.doString(
-                    `__call_hats(${JSON.stringify(hat)}, {})`
-                );
-                // callHatOnEngine result available (ignored)
+                if (info.engine && typeof info.engine.doString === 'function') {
+                    try {
+                        const res = await info.engine.doString(`__call_hats(${JSON.stringify(hat)}, {})`);
+                    } catch (e) {
+                        console.error("[luaEngine] callHatOnEngine failed for", tid, hat, e);
+                    }
+                }
             } catch (e) {
                 console.error("[luaEngine] callHatOnEngine failed for", tid, hat, e);
             }
@@ -1450,12 +1383,18 @@
             }
         }
         try {
-            if (typeof info.engine.doString === "function") {
-                await info.engine.doString(code);
-            } else if (typeof info.engine.run === "function") {
-                await info.engine.run(code);
-            } else {
-                // engine has no doString/run
+            if (info.engine && typeof info.engine.doString === "function") {
+                try {
+                    await info.engine.doString(code);
+                } catch (e) {
+                    console.error(`[luaEngine] runFor(${tid}) error:`, e);
+                }
+            } else if (info.engine && typeof info.engine.run === "function") {
+                try {
+                    await info.engine.run(code);
+                } catch (e) {
+                    console.error(`[luaEngine] runFor(${tid}) error:`, e);
+                }
             }
         } catch (e) {
             console.error(`[luaEngine] runFor(${tid}) error:`, e);
