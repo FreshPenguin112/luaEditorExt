@@ -1,16 +1,98 @@
 (function () {
-    /* Full luaEngine injection (per-target Wasmoon engines, Ace editor, robust Wasmoon loader,
-     per-target saved scripts, safe startHats patch + async dispatch, `on(hat,fn)` in Lua,
+    /* Full jsEngine injection (per-target Wasmoon engines, Ace editor, robust Wasmoon loader,
+     per-target saved scripts, safe startHats patch + async dispatch, `on(hat,fn)` in JS,
      and a simple `target` wrapper passed to handlers as opts.target). */
 
-    const container = document.querySelector(".injectionDiv");
+    let container = document.querySelector(".injectionDiv");
+    // If the host page doesn't provide an injection container, create a small
+    // floating container so the editor can appear (helps when running in dev).
+    if (!container) {
+        try {
+            container = document.createElement("div");
+            container.className = "injectionDiv";
+            // basic styles so it doesn't block page content
+            container.style.position = "fixed";
+            container.style.right = "8px";
+            container.style.bottom = "8px";
+            container.style.width = "420px";
+            container.style.height = "300px";
+            container.style.zIndex = "2147483647";
+            container.style.boxShadow = "0 2px 10px rgba(0,0,0,0.3)";
+            container.style.background = "#2b2b2b";
+            document.body.appendChild(container);
+        } catch (_) {
+            container = null;
+        }
+    }
     const uiEnabled = !!container;
 
-    const EXT_KEY = "luaengine";
+    const EXT_KEY = "jsengine";
     const _queuedStorage = {};
-    const luaEngines = new Map(); // tid -> { engine, target, async }
+    const jsEngines = new Map(); // tid -> { engine, target, async }
     const queuedHats = new Map(); // tid -> [{hatOpcode, options, target}]
     const foreverLoops = new Map(); // tid -> { map: Map(id->fn), rafId, running }
+
+    // Render interpolation state (optional smoothing layer). When enabled, logical positions
+    // are written by `fast_setx`/`fast_changexby` and the RAF loop interpolates visual
+    // positions toward the logical ones each animation frame for smooth rendering.
+    const renderInterp = {
+        enabled: false,
+        speed: 30, // smoothing param (higher = snappier)
+        rafId: null,
+        map: new Map(), // tid -> { logical: {x,y}, visual: {x,y} }
+    };
+
+    function startRenderInterpolationLoop() {
+        if (renderInterp.rafId != null) return;
+        let last = performance.now();
+        const tick = (now) => {
+            try {
+                if (!renderInterp.enabled) {
+                    renderInterp.rafId = null;
+                    return;
+                }
+                if (typeof now !== 'number') now = performance.now();
+                const dt = Math.max(0, (now - last) / 1000);
+                last = now;
+                const speed = Number(renderInterp.speed) || 30;
+                const alpha = 1 - Math.exp(-speed * dt); // smoothing fraction
+                for (const [tid, s] of renderInterp.map) {
+                    try {
+                        const logical = s.logical || { x: 0, y: 0 };
+                        const visual = s.visual || { x: logical.x, y: logical.y };
+                        // interpolate
+                        visual.x += (logical.x - visual.x) * alpha;
+                        visual.y += (logical.y - visual.y) * alpha;
+                        s.visual = visual;
+                        // write to actual target immediately (coincides with RAF so should be visible)
+                        try {
+                            const info = jsEngines.get(tid);
+                            if (info && info.target) {
+                                const t = info.target;
+                                if (typeof t.setXY === 'function') {
+                                    t.setXY(visual.x, visual.y);
+                                } else if ('x' in t) {
+                                    t.x = visual.x;
+                                }
+                            }
+                        } catch (_) {}
+                    } catch (_) {}
+                }
+            } catch (_) {}
+            renderInterp.rafId = requestAnimationFrame(tick);
+        };
+        last = performance.now();
+        renderInterp.rafId = requestAnimationFrame(tick);
+    }
+
+    function stopRenderInterpolationLoop() {
+        try {
+            if (renderInterp.rafId != null) {
+                try { cancelAnimationFrame(renderInterp.rafId); } catch(_) {}
+                renderInterp.rafId = null;
+            }
+        } catch (_) {}
+    }
     let loadedBlocksFull = null;
 
     function log(...a) {}
@@ -92,6 +174,7 @@
         return names;
     }
     loadedBlocksFull = buildProcessedBlocksFromToolbox();
+    try { createPageOpcodeWrappers(loadedBlocksFull); } catch(_) {}
 
     // ---------------- small script loader ----------------
     function loadScript(url, timeout = 20000) {
@@ -123,324 +206,797 @@
         });
     }
 
-    // ---------------- Ace editor (per-target persistence + completions) ----------------
+    // Ace editor (per-target persistence + completions) ----------------
     let editor = null;
     if (uiEnabled) {
-        const edDiv = document.createElement("div");
-        edDiv.id = "luaengine-editor";
-        edDiv.style.cssText = "position:relative;width:100%;height:100%;";
-        container.innerHTML = "";
-        container.appendChild(edDiv);
+        try {
+            // Create or reuse editor container inside the injection container
+            let edDiv = container.querySelector('#jsengine-editor');
+            if (!edDiv) {
+                edDiv = document.createElement('div');
+                edDiv.id = 'jsengine-editor';
+                edDiv.style.width = '100%';
+                edDiv.style.height = '100%';
+                edDiv.style.boxSizing = 'border-box';
+                // clear container to ensure editor takes full space
+                container.innerHTML = '';
+                container.appendChild(edDiv);
+            }
 
-        (async function initAce() {
-            try {
-                const ACE_URL =
-                    "https://cdn.jsdelivr.net/npm/ace-builds@1.22.0/src-min-noconflict/ace.js";
-                const LANGTOOLS_URL =
-                    "https://cdn.jsdelivr.net/npm/ace-builds@1.22.0/src-min-noconflict/ext-language_tools.js";
-                if (!window.ace) await loadScript(ACE_URL);
-
-                editor = ace.edit("luaengine-editor");
-                editor.session.setMode("ace/mode/lua");
-                editor.setTheme("ace/theme/monokai");
-                editor.setOptions({
-                    wrap: true,
-                    showPrintMargin: false,
-                    fontSize: 12,
-                });
-
-                await loadScript(LANGTOOLS_URL);
-                let langTools;
+            const loadAce = () => {
                 try {
-                    langTools =
-                        ace.require && ace.require("ace/ext/language_tools");
-                } catch (_) {
-                    langTools = null;
-                }
-                if (langTools)
+                    if (!window.ace) return false;
+                    const langTools = ace.require && ace.require('ace/ext/language_tools');
+                    editor = ace.edit('jsengine-editor');
+                    editor.session.setMode('ace/mode/javascript');
+                    editor.setTheme('ace/theme/monokai');
                     editor.setOptions({
                         enableBasicAutocompletion: true,
                         enableLiveAutocompletion: true,
                         enableSnippets: true,
                     });
 
-                // Clear editor initially - no global code
-                editor.setValue("", -1);
+                    // Clear editor initially - no global code
+                    editor.setValue('', -1);
 
-                // Save per-target on change WITHOUT auto-running
-                let _luaSaveDebounce = null;
-                editor.on("change", () => {
-                    const cur2 = window.vm?.editingTarget ?? null;
-                    if (!cur2) {
-                        // Don't save global code - clear it instead
-                        editor.setValue("", -1);
-                        return;
-                    }
-                    const id2 = cur2.id ?? cur2.spriteId ?? String(cur2);
-                    storageSet("lua", editor.getValue(), id2);
-                });
-
-                // poll editingTarget changes to reload editor
-                (function pollEditingTarget() {
-                    let lastId = null;
-                    setInterval(() => {
-                        (async () => {
-                            try {
-                                const t = window.vm?.editingTarget ?? null;
-                                const id = t
-                                    ? t.id ?? t.spriteId ?? String(t)
-                                    : null;
-                                if (id !== lastId) {
-                                    lastId = id;
-                                    // ensure engine created for this target and wait briefly
-                                    try {
-                                        if (t) await initLuaForTarget(t).catch(() => {});
-                                    } catch (_) {}
-                                    if (editor) {
-                                        if (id) {
-                                            let code = storageGet("lua", id) || "";
-                                            try {
-                                                const info = luaEngines.get(id);
-                                                if (info && info.engine) {
-                                                    const saved = await info.engine.global.get("__saved_script").catch(() => null);
-                                                    if (typeof saved === "string" && saved.length) code = saved;
-                                                }
-                                            } catch (_) {}
-                                            editor.setValue(code, -1);
-                                        } else {
-                                            // No target selected - clear editor
-                                            editor.setValue("", -1);
-                                        }
-                                    }
-                                }
-                            } catch (_) {}
-                        })();
-                    }, 150);
-                })();
-
-                // completer (stdlib + opcodes)
-                const stdlibList = [
-                    { caption: "move(steps)", value: "move(", meta: "stdlib" },
-                    {
-                        caption: "say(text, secs)",
-                        value: "say(",
-                        meta: "stdlib",
-                    },
-                    { caption: "sleep(ms)", value: "sleep(", meta: "stdlib" },
-                    {
-                        caption: "call(opcode, args)",
-                        value: "call(",
-                        meta: "stdlib",
-                    },
-                    {
-                        caption: "printjs(x)",
-                        value: "printjs(",
-                        meta: "stdlib",
-                    },
-                    {
-                        caption: "inspect_block_args(op)",
-                        value: "inspect_block_args(",
-                        meta: "stdlib",
-                    },
-                    { caption: "on(event, fn)", value: "on(", meta: "event" },
-                ];
-                function buildCompleter() {
-                    const opcodeEntries = [];
-                    if (loadedBlocksFull) {
-                        for (const op of Object.keys(loadedBlocksFull)) {
-                            const safe = op.replace(/[^A-Za-z0-9_]/g, "_");
-                            opcodeEntries.push({
-                                caption: safe + "()",
-                                value: safe + "(",
-                                meta: "opcode",
-                            });
+                    // Save per-target on change WITHOUT auto-running
+                    editor.on('change', () => {
+                        const cur2 = window.vm?.editingTarget ?? null;
+                        if (!cur2) {
+                            editor.setValue('', -1);
+                            return;
                         }
+                        const id2 = cur2.id ?? cur2.spriteId ?? String(cur2);
+                        storageSet('js', editor.getValue(), id2);
+                    });
+
+                    // completer (stdlib + opcodes)
+                    const stdlibList = [
+                        { caption: 'move(steps)', value: 'move(', meta: 'stdlib' },
+                        { caption: 'say(text, secs)', value: 'say(', meta: 'stdlib' },
+                        { caption: 'sleep(ms)', value: 'sleep(', meta: 'stdlib' },
+                        { caption: 'call(opcode, args)', value: 'call(', meta: 'stdlib' },
+                        { caption: 'print(x)', value: 'print(', meta: 'stdlib' },
+                        { caption: 'inspect_block_args(op)', value: 'inspect_block_args(', meta: 'stdlib' },
+                    ];
+                    const blockList = [];
+                    try {
+                        if (typeof loadedBlocksFull === 'object' && loadedBlocksFull) {
+                            for (const op of Object.keys(loadedBlocksFull)) {
+                                blockList.push({ caption: op + '()', value: op + '(', meta: 'opcode' });
+                            }
+                        }
+                    } catch (_) {}
+
+                    if (langTools && langTools.addCompleter) {
+                        langTools.addCompleter({
+                            getCompletions: function(editorInst, session, pos, prefix, callback) {
+                                if (!prefix || prefix.length < 1) { callback(null, []); return; }
+                                const list = [].concat(stdlibList, blockList).map(e => ({ caption: e.caption, value: e.value, meta: e.meta }));
+                                callback(null, list);
+                            }
+                        });
                     }
-                    const completions = stdlibList.concat(opcodeEntries);
-                    return {
-                        getCompletions: (_ed, _s, _p, prefix, cb) => {
-                            const list = completions
-                                .filter(
-                                    (c) =>
-                                        !prefix ||
-                                        c.caption
-                                            .toLowerCase()
-                                            .startsWith(prefix.toLowerCase())
-                                )
-                                .map((c) => ({
-                                    caption: c.caption,
-                                    value: c.value,
-                                    meta: c.meta,
-                                }));
-                            cb(null, list);
-                        },
-                    };
+                    return true;
+                } catch (e) {
+                    console.error('[jsEngine] ace init failed', e);
+                    return false;
                 }
+            };
+
+            if (!loadAce()) {
+                // try to inject ace script if missing
                 try {
-                    const lt =
-                        ace.require && ace.require("ace/ext/language_tools");
-                    if (lt) lt.addCompleter(buildCompleter());
-                } catch (_) {}
-            } catch (e) {
-                console.error("Editor init failed:", e);
+                    const s1 = document.createElement('script');
+                    s1.src = 'https://cdnjs.cloudflare.com/ajax/libs/ace/1.15.0/ace.js';
+                    s1.onload = () => {
+                        try {
+                            const s2 = document.createElement('script');
+                            s2.src = 'https://cdnjs.cloudflare.com/ajax/libs/ace/1.15.0/ext-language_tools.min.js';
+                            document.head.appendChild(s2);
+                        } catch (_) {}
+                        setTimeout(loadAce, 250);
+                    };
+                    document.head.appendChild(s1);
+                } catch (e) { console.error('[jsEngine] ace inject failed', e); }
             }
-        })();
+        } catch (e) { console.error('[jsEngine] ace setup failed', e); }
     }
 
-    // ---------------- Wasmoon loader (robust UMD, npm, fetch+eval fallback) ----------------
-    async function getWasmoonFactory() {
-        const tryResolve = (mod) => {
-            if (!mod) return null;
-            if (mod.LuaFactory && typeof mod.LuaFactory === "function")
-                return new mod.LuaFactory();
-            if (
-                mod.default &&
-                mod.default.LuaFactory &&
-                typeof mod.default.LuaFactory === "function"
-            )
-                return new mod.default.LuaFactory();
-            if (typeof mod === "function") {
-                try {
-                    return new mod();
-                } catch (_) {}
-            }
-            if (typeof mod.createEngine === "function") return mod;
-            return null;
-        };
-
-        const existing = window.wasmoon || window.Wasmoon || window.WasMoon;
-        const r1 = tryResolve(existing);
-        if (r1) return r1;
-
-        const UMD = "https://cdn.jsdelivr.net/npm/wasmoon@1.16.0";
-        try {
-            await loadScript(UMD);
-            const after = window.wasmoon || window.Wasmoon || window.WasMoon;
-            const r2 = tryResolve(after);
-            if (r2) return r2;
-        } catch (e) {
-            console.error("Wasmoon UMD load failed:", e && e.message ? e.message : e);
-        }
-
-        try {
-            await loadScript("https://cdn.jsdelivr.net/npm/wasmoon@1.16.0");
-            const after2 = window.wasmoon || window.Wasmoon || window.WasMoon;
-            const r3 = tryResolve(after2);
-            if (r3) return r3;
-        } catch (e) {
-            console.error(
-                "Wasmoon npm-bundle load failed:",
-                e && e.message ? e.message : e
-            );
-        }
-
-        try {
-            const resp = await fetch(
-                "https://cdn.jsdelivr.net/npm/wasmoon@1.16.0"
-            );
-            if (resp.ok) {
-                const code = await resp.text();
-                new Function(code)();
-                const after3 =
-                    window.wasmoon || window.Wasmoon || window.WasMoon;
-                const r4 = tryResolve(after3);
-                if (r4) return r4;
-            }
-        } catch (e) {
-            console.error("Wasmoon fetch+eval failed:", e && e.message ? e.message : e);
-        }
-
-        throw new Error("Wasmoon factory not found");
-    }
 
     async function sleep(ms) {
         return new Promise((r) => setTimeout(r, ms));
     }
-    async function callOpcode(opcode, args, target) {
-        const fn = window.vm?.runtime?.getOpcodeFunction?.(opcode);
-        if (!fn) throw new Error("Opcode not found: " + opcode);
-        return await fn(args || {}, { target });
+    function callOpcode(opcode, args, target) {
+        try {
+            const fn = window.vm?.runtime?.getOpcodeFunction?.(opcode);
+            try { window.jsEngine = window.jsEngine || {}; window.jsEngine._callLog = window.jsEngine._callLog || []; window.jsEngine._callLog.push({ opcode, hasFn: !!fn, args: args || {}, targetId: target && (target.id ?? target.spriteId ?? String(target)) || null, t: performance.now() }); } catch(_) {}
+            if (!fn) {
+                const err = new Error("Opcode not found: " + opcode);
+                console.error('[jsEngine] callOpcode: no opcode function for', opcode);
+                throw err;
+            }
+            const res = fn(args || {}, { target });
+            try { if (res && typeof res.then === 'function') { res.then((v)=>{ try { window.jsEngine._callLog.push({ opcode, result: v }); } catch(_){} }).catch((e)=>{ try { window.jsEngine._callLog.push({ opcode, error: String(e) }); } catch(_){} }); } else { window.jsEngine._callLog.push({ opcode, result: res }); } } catch(_) {}
+            return res;
+        } catch (e) {
+            console.error('[jsEngine] callOpcode error for', opcode, e);
+            throw e;
+        }
     }
 
-    // ---------------- initialize Wasmoon engine for a target ----------------
-    async function initLuaForTarget(target) {
+    // ---------------- per-target JS engine (replaces Wasmoon-based engine) ----------------
+    async function createJSEngineForTarget(tid, target) {
+        // Lightweight per-target JS 'engine' with simple global binding and code eval
+        const engine = {
+            _globals: {},
+            global: {
+                set: async (name, val) => {
+                    try { engine._globals[name] = val; } catch(_) {}
+                    return undefined;
+                },
+                get: async (name) => {
+                    try { return engine._globals[name]; } catch(_) { return undefined; }
+                },
+            },
+            // Execute JS code with globals injected as local variables. Returns the result of the code.
+            doString: async (code) => {
+                try {
+                    // Provide globals as named args and also a 'global' object for explicit assignment
+                    const names = Object.keys(engine._globals || {});
+                    const vals = names.map(k => engine._globals[k]);
+                    const fn = new Function(...names, 'global', 'tid', 'target', '"use strict";\n' + String(code));
+                    return fn(...vals, engine._globals, tid, target);
+                } catch (e) {
+                    console.error('[jsEngine] doString error:', e, code);
+                    throw e;
+                }
+            }
+        };
+
+        // Helper API on the engine side: small hat registry and helpers that mimic the legacy helpers
+        engine._hatRegistry = engine._hatRegistry || {};
+        engine._hatNextId = engine._hatNextId || 0;
+
+        const matches = (matchers, opts) => {
+            if (!matchers || matchers.length === 0) return true;
+            try {
+                // If opts has _args (array-like), prefer positional matching
+                const args = opts && opts._args ? opts._args : null;
+                if (args && args.length >= matchers.length) {
+                    for (let i = 0; i < matchers.length; i++) {
+                        const m = matchers[i];
+                        const a = args[i];
+                        if (m == null) continue;
+                        if (typeof a === 'string' && typeof m === 'string') {
+                            if (String(a).toLowerCase() !== String(m).toLowerCase()) return false;
+                        } else {
+                            if (String(a) !== String(m)) return false;
+                        }
+                    }
+                    return true;
+                }
+                // fallback: deep contains
+                const deepContains = (obj, val, seen) => {
+                    if (!seen) seen = new Set();
+                    if (obj === val) return true;
+                    if (obj && typeof obj === 'object' && !seen.has(obj)) {
+                        seen.add(obj);
+                        for (const k in obj) {
+                            try { if (deepContains(obj[k], val, seen)) return true; } catch(_) {}
+                        }
+                    }
+                    return false;
+                };
+                for (let i = 0; i < matchers.length; i++) {
+                    const m = matchers[i];
+                    if (!deepContains(opts, m)) return false;
+                }
+                return true;
+            } catch (_) { return false; }
+        };
+
+        // expose helpers as globals so user scripts can call them directly
+        await engine.global.set('js_table_from_js', (tbl) => tbl);
+        await engine.global.set('print', (s) => console.log(`[js:${tid}]`, s));
+        await engine.global.set('on', (hat, ...args) => {
+            try {
+                const last = args[args.length - 1];
+                if (typeof last !== 'function') return () => {};
+                const fn = last;
+                const matchers = args.length > 1 ? args.slice(0, -1) : null;
+                engine._hatNextId = (engine._hatNextId || 0) + 1;
+                const id = String(engine._hatNextId);
+                engine._hatRegistry[hat] = engine._hatRegistry[hat] || [];
+                engine._hatRegistry[hat].push({ id, fn, matchers });
+                // notify host
+                try { const reg = engine._globals['__register_hat_in_js']; if (typeof reg === 'function') reg(hat, 1); } catch(_) {}
+                return () => {
+                    const list = engine._hatRegistry[hat] || [];
+                    for (let i = list.length - 1; i >= 0; i--) {
+                        if (String(list[i].id) === id) {
+                            list.splice(i, 1);
+                            try { const reg = engine._globals['__register_hat_in_js']; if (typeof reg === 'function') reg(hat, -1); } catch(_) {}
+                            break;
+                        }
+                    }
+                };
+            } catch (e) { console.error('[jsEngine] on failed', e); return () => {}; }
+        });
+        await engine.global.set('__call_hats', (hat, opts) => {
+            try {
+                const list = engine._hatRegistry[hat] || [];
+                const snapshot = list.slice();
+                for (let i = 0; i < snapshot.length; i++) {
+                    try {
+                        const entry = snapshot[i];
+                        if (!entry || typeof entry.fn !== 'function') continue;
+                        if (entry.matchers && !matches(entry.matchers, opts || {})) continue;
+                        try {
+                            entry.fn(opts);
+                        } catch (e) { console.error('[jsEngine] hat error', e); }
+                    } catch (_) {}
+                }
+            } catch (e) { console.error('[jsEngine] __call_hats failed', e); }
+        });
+        await engine.global.set('__dump_registry_types', () => {
+            try {
+                const out = [];
+                for (const k in engine._hatRegistry) {
+                    const arr = engine._hatRegistry[k] || [];
+                    for (let i = 0; i < arr.length; i++) {
+                        const entry = arr[i];
+                        out.push(String(k) + ':' + String(i + 1) + ':' + (entry && entry.fn ? 'table(id=' + String(entry.id) + ',fn=function)' : String(typeof entry)));
+                    }
+                }
+                return out.join(',');
+            } catch (_) { return ''; }
+        });
+
+        // convenience forever/foreverFixed that delegate to the registered host hooks
+        await engine.global.set('forever', (fn) => {
+            try {
+                const reg = engine._globals['__register_forever_in_js'];
+                if (typeof reg === 'function') return reg(fn);
+            } catch (e) { console.error('[jsEngine] forever register failed', e); }
+            return () => {};
+        });
+        await engine.global.set('foreverFixed', (fn, fps) => {
+            try {
+                const reg = engine._globals['__register_forever_fixed_in_js'];
+                if (typeof reg === 'function') return reg(fn, fps || 60);
+            } catch (e) { console.error('[jsEngine] foreverFixed register failed', e); }
+            return () => {};
+        });
+
+        return engine;
+    }
+
+    // ---------------- initialize per-target engine for a target ----------------
+    async function initEngineForTarget(target) {
         if (!target) throw new Error("target required");
         const tid = target.id ?? target.spriteId ?? String(target);
-        if (luaEngines.has(tid)) return luaEngines.get(tid);
+        if (jsEngines.has(tid)) return jsEngines.get(tid);
 
-        const factory = await getWasmoonFactory();
-        const engine = await (factory.createEngine?.() || factory);
+        // Use a per-target JS engine instead of Wasmoon-based engine
+        const engine = await createJSEngineForTarget(tid, target);
 
-            await engine.global.set("js_print", (s) => console.log(`[lua:${tid}]`, s));
+            await engine.global.set("js_print", (s) => console.log(`[js:${tid}]`, s));
         await engine.global.set("sleep", (ms) => sleep(Number(ms || 0)));
-        await engine.global.set("call", async (opcode, args) =>
+        await engine.global.set("call", (opcode, args) =>
             callOpcode(opcode, args || {}, target)
         );
         await engine.global.set("keyDown", (key) => vm.runtime.ioDevices.keyboard.getKeyIsDown(key));
         await engine.global.set("keyHit", (key) => vm.runtime.ioDevices.keyboard.getKeyIsHit(key));
+
+        // Expose opcode functions as direct globals in the per-target JS engine. Each opcode's JS
+        // implementation is fetched *once* via getOpcodeFunction at engine startup and
+        // bound directly to a global named after a sanitized opcode (non-alphanumerics
+        // replaced with underscores). If the JS implementation returns a Promise, callers
+        // get a Promise; synchronous functions return values directly and do not need special awaiting.
+        try {
+            if (typeof loadedBlocksFull === 'object' && loadedBlocksFull !== null) {
+                for (const op of Object.keys(loadedBlocksFull)) {
+                    try {
+                        const fn = window.vm?.runtime?.getOpcodeFunction?.(op);
+                        const safe = op.replace(/[^A-Za-z0-9_]/g, "_");
+                        if (typeof fn === 'function') {
+                            // Bind the opcode once. We don't wrap it with async so synchronous
+                            // opcodes return directly and don't force :await().
+                            await engine.global.set(safe, (args, opts) => fn(args || {}, { target }));
+                        } else {
+                            // Provide a stub that throws if the opcode isn't available
+                            await engine.global.set(safe, () => {
+                                throw new Error('Opcode not found: ' + op);
+                            });
+                        }
+                    } catch (_) {}
+                }
+            }
+        } catch (_) {}
+
+        // Create JS wrappers now that 'call' and direct opcode globals exist
+        try { await injectOpcodeWrappersIntoEngine(engine, loadedBlocksFull); } catch(_) {}
+
+        // Fast direct position ops: bypass opcode rounding/queuing and set target position directly.
+        // Use these from JS when you need high-frequency, sub-pixel updates (e.g., game-like movement).
+        try {
+            await engine.global.set("fast_setx", (x) => {
+                try {
+                    const nx = Number(x);
+                    // update logical position
+                    try {
+                        const rs = renderInterp.map.get(tid) || { logical: { x: 0, y: 0 }, visual: { x: 0, y: 0 } };
+                        rs.logical.x = nx;
+                        renderInterp.map.set(tid, rs);
+                    } catch (_) {}
+
+                    let wroteTarget = false;
+                    if (!renderInterp.enabled) {
+                        // immediate write if interpolation disabled
+                        if (typeof target.setXY === 'function') {
+                            target.setXY(nx, typeof target.y === 'number' ? target.y : 0);
+                            wroteTarget = true;
+                        } else if (typeof target.setXY === 'undefined' && 'x' in target) {
+                            target.x = nx;
+                            wroteTarget = true;
+                        }
+                    }
+
+                    // Optionally force an immediate render on the VM renderer to reflect the change visually.
+                    try {
+                        if (window.jsEngine && window.jsEngine.forceImmediateRender) {
+                            const r = window.vm && window.vm.renderer;
+                            if (r) {
+                                try { if (typeof r.draw === 'function') r.draw(); } catch (_) {}
+                                try { if (typeof r.redraw === 'function') r.redraw(); } catch (_) {}
+                                try { if (typeof r.updateDrawableProperties === 'function') r.updateDrawableProperties(); } catch (_) {}
+                                try { if (typeof r._draw === 'function') r._draw(); } catch (_) {}
+                            }
+                        }
+                    } catch (_) {}
+
+                    // Diagnostic: record this fast_setx event
+                    try {
+                        if (window.jsEngine && window.jsEngine._pushDiag) {
+                            const rs2 = renderInterp.map.get(tid) || { logical: { x: NaN }, visual: { x: NaN } };
+                            window.jsEngine._pushDiag({
+                                tid: String(tid),
+                                op: 'fast_setx',
+                                arg: nx,
+                                logical: Number(rs2.logical.x),
+                                targetX: (typeof target.x === 'number' ? target.x : (typeof target.getX === 'function' ? target.getX() : null)),
+                                wroteTarget: !!wroteTarget
+                            });
+                        }
+                    } catch (_) {}
+                } catch (_) {}
+            });
+            await engine.global.set("fast_changexby", (dx) => {
+                try {
+                    const delta = Number(dx);
+                    const rs = renderInterp.map.get(tid) || { logical: { x: 0, y: 0 }, visual: { x: 0, y: 0 } };
+                    const curx = (typeof rs.logical.x === 'number') ? rs.logical.x : (typeof target.x === 'number' ? target.x : (typeof target.getX === 'function' ? target.getX() : 0));
+                    const ny = typeof target.y === 'number' ? target.y : (typeof target.getY === 'function' ? target.getY() : 0);
+                    const nx = curx + delta;
+                    try { rs.logical.x = nx; renderInterp.map.set(tid, rs); } catch(_) {}
+
+                    let wroteTarget = false;
+                    if (!renderInterp.enabled) {
+                        if (typeof target.setXY === 'function') {
+                            target.setXY(nx, ny);
+                            wroteTarget = true;
+                        } else if ('x' in target) {
+                            target.x = nx;
+                            wroteTarget = true;
+                        }
+                    }
+
+                    // Optionally force immediate render
+                    try {
+                        if (window.jsEngine && window.jsEngine.forceImmediateRender) {
+                            const r = window.vm && window.vm.renderer;
+                            if (r) {
+                                try { if (typeof r.draw === 'function') r.draw(); } catch (_) {}
+                                try { if (typeof r.redraw === 'function') r.redraw(); } catch (_) {}
+                                try { if (typeof r.updateDrawableProperties === 'function') r.updateDrawableProperties(); } catch (_) {}
+                                try { if (typeof r._draw === 'function') r._draw(); } catch (_) {}
+                            }
+                        }
+                    } catch (_) {}
+
+                    // Diagnostic: record this fast_changexby event
+                    try {
+                        if (window.jsEngine && window.jsEngine._pushDiag) {
+                            const rs2 = renderInterp.map.get(tid) || { logical: { x: NaN }, visual: { x: NaN } };
+                            window.jsEngine._pushDiag({
+                                tid: String(tid),
+                                op: 'fast_changexby',
+                                arg: delta,
+                                logical: Number(rs2.logical.x),
+                                targetX: (typeof target.x === 'number' ? target.x : (typeof target.getX === 'function' ? target.getX() : null)),
+                                wroteTarget: !!wroteTarget
+                            });
+                        }
+                    } catch (_) {}
+                } catch (_) {}
+            });
+            await engine.global.set("fast_xposition", () => {
+                try {
+                    if (typeof target.x === 'number') return target.x;
+                    if (typeof target.getX === 'function') return target.getX();
+                    return 0;
+                } catch (_) { return 0; }
+            });
+            // Debug toggle for forever processing; set to true to enable per-tick logs
+            try {
+                await engine.global.set("set_forever_debug", (v) => {
+                    try {
+                        window.jsEngine = window.jsEngine || {};
+                        window.jsEngine.foreverDebug = !!v;
+                    } catch (_) {}
+                });
+            } catch (_) {}
+        } catch (_) {}
+
         try {
             await engine.global.set("__register_hat_in_js", (hat, delta) => {
                 try {
-                    window.luaEngine &&
-                        window.luaEngine._registerHatForEngine &&
-                        window.luaEngine._registerHatForEngine(tid, hat, delta);
+                    window.jsEngine &&
+                        window.jsEngine._registerHatForEngine &&
+                        window.jsEngine._registerHatForEngine(tid, hat, delta);
                 } catch (_) {}
             });
+        } catch (_) {}
+
+        // Expose JS helper to toggle render interpolation from the console
+        try {
+            window.jsEngine = window.jsEngine || {};
+            if (!window.jsEngine.setRenderInterpolation) {
+                window.jsEngine.setRenderInterpolation = (enabled, speed) => {
+                    try {
+                        renderInterp.enabled = !!enabled;
+                        renderInterp.speed = Number(speed) || renderInterp.speed;
+                        if (renderInterp.enabled) startRenderInterpolationLoop();
+                        else stopRenderInterpolationLoop();
+                        window.jsEngine.renderInterpolationEnabled = !!enabled;
+                        window.jsEngine.renderInterpolationSpeed = renderInterp.speed;
+                    } catch (_) {}
+                };
+                // Diagnostics storage for fast_* events and batch processing
+                window.jsEngine._diags = window.jsEngine._diags || [];
+                window.jsEngine._pushDiag = (obj) => {
+                    try {
+                        window.jsEngine._diags = window.jsEngine._diags || [];
+                        window.jsEngine._diags.push(Object.assign({ t: performance.now() }, obj));
+                        if (window.jsEngine._diags.length > 5000) window.jsEngine._diags.shift();
+                    } catch (_) {}
+                };
+                window.jsEngine.getDiagnostics = (tid) => {
+                    try {
+                        if (!tid) return (window.jsEngine._diags || []).slice(-1000);
+                        const sid = String(tid);
+                        return (window.jsEngine._diags || []).filter(d => d.tid === sid).slice(-1000);
+                    } catch (_) { return []; }
+                };
+                // Control whether forever() uses Dedicated WebWorkers (default: true). If false, run on main thread at 60Hz.
+                window.jsEngine.useForeverWorkers = window.jsEngine.useForeverWorkers !== undefined ? window.jsEngine.useForeverWorkers : true;
+                // Tuning knobs: batch size and time budget to avoid long main-thread tasks (editable from console)
+                // Choose conservative defaults for main-thread mode to avoid long tasks
+                const defaultBatch = (window.jsEngine && window.jsEngine.useForeverWorkers === false) ? 32 : 120;
+                const defaultTimeBudget = (window.jsEngine && window.jsEngine.useForeverWorkers === false) ? 2 : 4;
+                window.jsEngine.foreverBatchSteps = Number.isFinite(window.jsEngine.foreverBatchSteps) ? window.jsEngine.foreverBatchSteps : defaultBatch;
+                window.jsEngine.foreverTimeBudgetMs = Number.isFinite(window.jsEngine.foreverTimeBudgetMs) ? window.jsEngine.foreverTimeBudgetMs : defaultTimeBudget;
+                window.jsEngine.foreverMainThreadIntervalMs = Number.isFinite(window.jsEngine.foreverMainThreadIntervalMs) ? window.jsEngine.foreverMainThreadIntervalMs : Math.round(1000/60);
+                // Diagnostic: run a short trace for a target to collect logical/visual/target deltas
+                if (!window.jsEngine.runRenderTrace) {
+                    window.jsEngine.runRenderTrace = async (tidOrTarget, durationMs = 1000) => {
+                        try {
+                            // Accept either a tid (string/number) or a target object
+                            let tid = tidOrTarget;
+                            if (tidOrTarget && typeof tidOrTarget === 'object') tid = tidOrTarget.id ?? tidOrTarget.spriteId ?? String(tidOrTarget);
+                            tid = String(tid);
+
+                            // Try to get engine info; if not available, try to locate a target in vm.runtime.targets
+                            let info = jsEngines.get(tid);
+                            if (!info) {
+                                try {
+                                    const targets = window.vm && window.vm.runtime && window.vm.runtime.targets;
+                                    if (Array.isArray(targets)) {
+                                        const t = targets.find(tt => String(tt.id) === tid);
+                                        if (t) info = { target: t };
+                                    }
+                                } catch (_) {}
+                            }
+
+                            if (!info) {
+                                console.warn('[jsEngine] runRenderTrace: no engine or target for tid', tidOrTarget);
+                                return null;
+                            }
+
+                            const samples = [];
+                            const end = performance.now() + durationMs;
+
+                            // sample on RAF to get painted/visual after frame
+                            await new Promise((resolve) => {
+                                function frame(now) {
+                                    try {
+                                        const rs = renderInterp.map.get(tid);
+
+                                        let logicalX = Number(rs && rs.logical && rs.logical.x);
+                                        let visualX = Number(rs && rs.visual && rs.visual.x);
+
+                                        const target = info.target;
+                                        const targetX = (typeof target.x === 'number') ? target.x : (typeof target.getX === 'function' ? target.getX() : NaN);
+
+                                        // Fallbacks: if interpolation state is missing, try direct target reads
+                                        if (!Number.isFinite(logicalX)) {
+                                            if (typeof target.getLogicalX === 'function') logicalX = Number(target.getLogicalX());
+                                            else if (typeof target.x === 'number') logicalX = Number(target.x);
+                                            else if (typeof target.getX === 'function') logicalX = Number(target.getX());
+                                            else logicalX = NaN;
+                                        }
+                                        if (!Number.isFinite(visualX)) {
+                                            // Prefer painted/target value if available, otherwise fall back to logical
+                                            visualX = Number.isFinite(targetX) ? targetX : logicalX;
+                                        }
+
+                                        samples.push({ t: now, logicalX, visualX, targetX });
+                                    } catch (_) {}
+                                    if (performance.now() < end) requestAnimationFrame(frame);
+                                    else resolve();
+                                }
+                                requestAnimationFrame(frame);
+                            });
+
+                            // analyze (guard against NaN values)
+                            const deltas = samples.map(s => ({ deltaVisTarget: Number(s.visualX) - Number(s.targetX), deltaLogicalTarget: Number(s.logicalX) - Number(s.targetX) }));
+                            const safeAbs = (v) => Number.isFinite(v) ? Math.abs(v) : 0;
+                            const stats = {
+                                samples: samples.length,
+                                maxDeltaVisTarget: Math.max(...deltas.map(d => safeAbs(d.deltaVisTarget)), 0),
+                                maxDeltaLogicalTarget: Math.max(...deltas.map(d => safeAbs(d.deltaLogicalTarget)), 0),
+                                meanDeltaVisTarget: deltas.reduce((a,b)=>a+safeAbs(b.deltaVisTarget),0)/Math.max(1,deltas.length),
+                                meanDeltaLogicalTarget: deltas.reduce((a,b)=>a+safeAbs(b.deltaLogicalTarget),0)/Math.max(1,deltas.length)
+                            };
+
+                            console.group('[jsEngine] runRenderTrace', tid);
+                            console.log('samples', samples.length, 'durationMs', durationMs);
+                            console.table(samples.slice(0, 20));
+                            console.log('stats', stats);
+                            console.groupEnd();
+                            return { samples, stats };
+                        } catch (e) {
+                            console.error('[jsEngine] runRenderTrace failed:', e);
+                            return null;
+                        }
+                    };
+                }
+
+                // ----- NEW DEBUG HELPERS -----
+                try {
+                    window.jsEngine.inspectOpcode = function(opcode) {
+                        try {
+                            const s = String(opcode);
+                            let cat = 'misc', method = s;
+                            const u = s.indexOf('_'), d = s.indexOf('.');
+                            if (u !== -1) { cat = s.slice(0, u); method = s.slice(u+1); }
+                            else if (d !== -1) { cat = s.slice(0, d); method = s.slice(d+1); }
+                            const safe = s.replace(/[^A-Za-z0-9_]/g, '_');
+                            const safeCat = cat.replace(/[^A-Za-z0-9_]/g, '_');
+                            const safeMethod = method.replace(/[^A-Za-z0-9_]/g, '_');
+                            return {
+                                opcode: s,
+                                safeGlobal: safe,
+                                safeCat,
+                                safeMethod,
+                                hasLiteralGlobal: typeof globalThis[s] === 'function',
+                                hasSafeGlobal: typeof globalThis[safe] === 'function',
+                                hasCatMethod: (globalThis[safeCat] && typeof globalThis[safeCat][safeMethod] === 'function') || false,
+                                lastWrapperCalls: (window.jsEngine && window.jsEngine._lastWrapperCalls) || [],
+                                lastGeneratedSrc: (window.jsEngine && window.jsEngine._lastGeneratedWrapperSource) || '',
+                                callLog: (window.jsEngine && window.jsEngine._callLog) || []
+                            };
+                        } catch (e) { return { error: String(e) }; }
+                    };
+
+                    window.jsEngine.testCall = async function(opcode, args, tid) {
+                        try {
+                            const t = (typeof tid === 'object') ? tid : (tid ? (window.vm && window.vm.runtime && window.vm.runtime.targets && window.vm.runtime.targets.find(tt => String(tt.id) === String(tid))) : (window.vm ? window.vm.editingTarget : null));
+                            const res = callOpcode(opcode, args || {}, t || null);
+                            if (res && typeof res.then === 'function') return await res;
+                            return res;
+                        } catch (e) { throw e; }
+                    };
+
+                    window.jsEngine.getOpcodeFn = function(opcode) {
+                        try { return window.vm && window.vm.runtime && window.vm.runtime.getOpcodeFunction && window.vm.runtime.getOpcodeFunction(opcode); } catch(_) { return null; }
+                    };
+                } catch (_) {}
+                // ----- END DEBUG HELPERS -----
+
+            }
         } catch (_) {}
         try {
             await engine.global.set("__register_forever_in_js", (fn) => {
                 try {
+                        const id = Date.now().toString(36) + '_' + Math.random().toString(36).slice(2);
                     let state = foreverLoops.get(tid);
                     if (!state) {
-                        state = { map: new Map(), rafId: null, running: false };
+                        state = { map: new Map() };
                         foreverLoops.set(tid, state);
                     }
-                    const id = Date.now().toString(36) + '_' + Math.random().toString(36).slice(2);
-                    state.map.set(id, fn);
-                    if (!state.running) {
-                        state.running = true;
-                        let lastTime = performance.now();
-                        const tick = (now) => {
+                    state.map.set(id, { fn, worker: null, url: null, accumulator: 0, intervalId: null, _stopMainLoop: null });
+
+                    // shared tick handler used by either the Worker or the main-thread timer
+                    const onTick = (data) => {
+                        try {
+                            if (!data || data.cmd !== 'tick') return;
+                            let dt = Math.max(0, Number(data.dt) || 0);
+                            const STEP = 1 / 240; // physics timestep
+                            const MAX_SUBSTEPS = 1000; // allow draining large accumulators for smoothness
+                            const BATCH_STEPS = (window.jsEngine && Number.isFinite(window.jsEngine.foreverBatchSteps)) ? Number(window.jsEngine.foreverBatchSteps) : 120; // steps per micro-batch to avoid long blocks
+                            const TIME_BUDGET_MS = (window.jsEngine && Number.isFinite(window.jsEngine.foreverTimeBudgetMs)) ? Number(window.jsEngine.foreverTimeBudgetMs) : (window.jsEngine && Number.isFinite(window.jsEngine.foreverTimeBudgetMs)) ? Number(window.jsEngine.foreverTimeBudgetMs) : 4; // cap time per micro-batch
+
+                            const entry = state.map.get(id);
+                            if (!entry) return;
+
+                            if (!entry.accumulator) entry.accumulator = 0;
+                            entry.accumulator += dt;
+
+                            // Optionally log debug info before processing
+                            if (window.jsEngine && window.jsEngine.foreverDebug) {
+                                try {
+                                    const px = typeof target.x === 'number' ? target.x : (typeof target.getX === 'function' ? target.getX() : NaN);
+                                    console.log(`[jsEngine][${tid}] [${id}] tick dt=${dt.toFixed(4)} acc=${entry.accumulator.toFixed(4)} preX=${Number(px).toFixed(3)}`);
+                                } catch (_) {}
+                            }
+
+                            // Number of full STEP updates we need to run
+                            let fullSteps = Math.floor(entry.accumulator / STEP);
+                            if (fullSteps > MAX_SUBSTEPS) fullSteps = MAX_SUBSTEPS;
+                            // Diagnostic: record large batch drains or long accumulators
                             try {
-                                if (typeof now !== 'number') now = performance.now();
-                                let dt = (now - lastTime) / 1000;
-                                // cap dt to avoid huge jumps after tab switch or pauses
-                                if (!isFinite(dt) || dt <= 0) dt = 0;
-                                if (dt > 0.1) dt = 0.1;
-                                lastTime = now;
-                                const items = Array.from(state.map.values());
-                                // Sub-step the dt to improve integration stability (smooth motion on variable frame rates)
-                                const STEP = 1 / 60; // base step ~16.66ms
-                                const MAX_SUBSTEPS = 5; // avoid spiraling when dt is large
-                                const substeps = Math.min(MAX_SUBSTEPS, Math.max(1, Math.ceil(dt / STEP)));
-                                const subDt = dt / substeps;
-                                for (const f of items) {
-                                    try {
-                                        for (let s = 0; s < substeps; s++) {
-                                            const res = f(subDt);
-                                            if (res && typeof res.then === 'function') res.catch(e => console.error(`[luaEngine] forever fn error for ${tid}:`, e));
-                                        }
-                                    } catch (e) {
-                                        console.error(`[luaEngine] forever fn error for ${tid}:`, e);
-                                    }
+                                if (window.jsEngine && window.jsEngine._pushDiag && (fullSteps > 20 || entry.accumulator > STEP * 10)) {
+                                    window.jsEngine._pushDiag({ tid: String(tid), op: 'batch', id, fullSteps, accumulator: entry.accumulator });
                                 }
-                            } catch (_) {}
-                            state.rafId = requestAnimationFrame(tick);
-                        };
-                        lastTime = performance.now();
-                        state.rafId = requestAnimationFrame(tick);
+                            } catch(_) {}
+
+                            // process batches so we don't block the main thread for too long
+                            const processBatch = (stepsToRun) => {
+                                const t0 = performance.now();
+                                let ran = 0;
+                                while (ran < stepsToRun) {
+                                    try {
+                                        const res = fn(STEP);
+                                        if (res && typeof res.then === 'function') res.catch(e => console.error(`[jsEngine] forever fn error for ${tid}:`, e));
+                                    } catch (e) {
+                                        console.error(`[jsEngine] forever fn error for ${tid}:`, e);
+                                    }
+                                    entry.accumulator -= STEP;
+                                    ran++;
+                                    // respect a small time budget
+                                    if (performance.now() - t0 > TIME_BUDGET_MS) break;
+                                }
+                                return { ran, time: performance.now() - t0 };
+                            };
+
+                            const runBatches = (remaining) => {
+                                if (remaining <= 0) return;
+                                const toRun = Math.min(remaining, BATCH_STEPS);
+                                const result = processBatch(toRun);
+                                remaining -= result.ran;
+                                // if we still have work, schedule continuation to yield to the event loop
+                                if (remaining > 0 && remaining <= MAX_SUBSTEPS) {
+                                    setTimeout(() => runBatches(remaining), 0);
+                                }
+                            };
+
+                            if (fullSteps > 0) runBatches(fullSteps);
+
+                            // fractional leftover step to reduce visible latency
+                            if (entry.accumulator > 0) {
+                                const rem = Math.min(entry.accumulator, STEP);
+                                try {
+                                    const res = fn(rem);
+                                    if (res && typeof res.then === 'function') res.catch(e => console.error(`[jsEngine] forever fn error for ${tid}:`, e));
+                                } catch (e) {
+                                    console.error(`[jsEngine] forever fn error for ${tid}:`, e);
+                                }
+                                entry.accumulator -= rem;
+                                if (entry.accumulator < 0) entry.accumulator = 0;
+                            }
+
+                            // Optionally log debug info after processing
+                            if (window.jsEngine && window.jsEngine.foreverDebug) {
+                                try {
+                                    const px2 = typeof target.x === 'number' ? target.x : (typeof target.getX === 'function' ? target.getX() : NaN);
+                                    console.log(`[jsEngine][${tid}] [${id}] post acc=${entry.accumulator.toFixed(4)} postX=${Number(px2).toFixed(3)}`);
+                                } catch (_) {}
+                            }
+                        } catch (_) {}
+                    };
+
+                    // If configured to run forever loops on the main thread, use a 60Hz timer instead of a worker
+                    if (window.jsEngine && window.jsEngine.useForeverWorkers === false) {
+                        try {
+                            const entry = state.map.get(id);
+                            let running = true;
+                            let last = performance.now();
+                            const schedule = () => {
+                                try {
+                                    if (!running) return;
+                                    const now = performance.now();
+                                    let dt = (now - last) / 1000;
+                                    if (!isFinite(dt) || dt <= 0) dt = 0;
+                                    if (dt > 0.1) dt = 0.1;
+                                    last = now;
+                                    onTick({ cmd: 'tick', dt });
+                                } catch (_) {}
+                                // configured main-thread interval (default ~60Hz)
+                                const mainInterval = (window.jsEngine && Number.isFinite(window.jsEngine.foreverMainThreadIntervalMs)) ? Number(window.jsEngine.foreverMainThreadIntervalMs) : Math.round(1000/60);
+                                entry.intervalId = setTimeout(schedule, mainInterval);
+                            };
+                            const mainInterval = (window.jsEngine && Number.isFinite(window.jsEngine.foreverMainThreadIntervalMs)) ? Number(window.jsEngine.foreverMainThreadIntervalMs) : Math.round(1000/60);
+                            entry.intervalId = setTimeout(schedule, mainInterval);
+                            entry._stopMainLoop = () => { running = false; };
+                        } catch (_) {}
+                    } else {
+                        // Create a WebWorker to post ticks as fast as the worker event loop allows
+                        const workerSrc = `
+                            let last = performance.now();
+                            function tick() {
+                                try {
+                                    const now = performance.now();
+                                    let dt = (now - last) / 1000;
+                                    if (!isFinite(dt) || dt <= 0) dt = 0;
+                                    if (dt > 0.1) dt = 0.1;
+                                    last = now;
+                                    postMessage({ cmd: 'tick', dt });
+                                } catch (e) {}
+                            }
+                            let running = true;
+                            function scheduleNext() {
+                                try {
+                                    if (!running) return;
+                                    tick();
+                                    setTimeout(scheduleNext, 0);
+                                } catch(e) { /* swallow */ }
+                            }
+                            scheduleNext();
+                            onmessage = function(e) {
+                                try {
+                                    if (e.data && e.data.cmd === 'stop') { running = false; close(); }
+                                } catch(_) {}
+                            };
+                        `;
+                        const blob = new Blob([workerSrc], { type: 'application/javascript' });
+                        const url = URL.createObjectURL(blob);
+                        const worker = new Worker(url);
+                        const entry = state.map.get(id);
+                        entry.worker = worker;
+                        entry.url = url;
+                        worker.onmessage = (ev) => { try { onTick(ev.data); } catch(_) {} };
                     }
+
                     const cancel = () => {
                         try {
                             const s = foreverLoops.get(tid);
                             if (!s) return;
+                            const entry = s.map.get(id);
+                            if (!entry) return;
+                            try { if (entry._stopMainLoop) entry._stopMainLoop(); } catch (_) {}
+                            try { if (entry.intervalId) clearTimeout(entry.intervalId); } catch (_) {}
+                            try { if (entry.worker) entry.worker.postMessage({ cmd: 'stop' }); } catch (_) {}
+                            try { if (entry.worker) entry.worker.terminate(); } catch (_) {}
+                            try { if (entry.url) URL.revokeObjectURL(entry.url); } catch (_) {}
                             s.map.delete(id);
                             if (s.map.size === 0) {
-                                try { if (s.rafId != null) cancelAnimationFrame(s.rafId); } catch (_) {}
                                 foreverLoops.delete(tid);
                             }
                         } catch (_) {}
                     };
+
                     return cancel;
                 } catch (e) {
                     console.error('register_forever_in_js failed:', e);
@@ -449,205 +1005,216 @@
             });
         } catch (_) {}
 
-        await engine.doString(`
-      function lua_table_from_js(tbl)
-        if type(tbl) ~= 'table' then return tbl end
-        local out = {}
-        for k,v in pairs(tbl) do
-          if type(v) == 'table' then out[k] = lua_table_from_js(v) else out[k] = v end
-        end
-        return out
-      end
-    `);
+        // Add a fixed-rate forever registration for legacy per-frame code that depends on a stable
+        // call rate (e.g., one call per 'frame' at 60Hz). Usage in JS: foreverFixed(fn, fps)
+        try {
+            await engine.global.set("__register_forever_fixed_in_js", (fn, fps) => {
+                try {
+                    const id = Date.now().toString(36) + '_' + Math.random().toString(36).slice(2);
+                    const fpsN = Number(fps) > 0 ? Number(fps) : 60;
+                    const intervalMs = Math.max(1, Math.round(1000 / fpsN));
+                    const workerSrc = `
+                        let last = performance.now();
+                        function tick() {
+                            try {
+                                const now = performance.now();
+                                let dt = (now - last) / 1000;
+                                if (!isFinite(dt) || dt <= 0) dt = 0;
+                                if (dt > 0.1) dt = 0.1;
+                                last = now;
+                                postMessage({ cmd: 'tick', dt });
+                            } catch (e) {}
+                        }
+                        let interval = setInterval(tick, ${intervalMs});
+                        onmessage = function(e) {
+                            try {
+                                if (e.data && e.data.cmd === 'stop') { try { clearInterval(interval); } catch(_) {} close(); }
+                            } catch(_) {}
+                        };
+                    `;
+                    let state = foreverLoops.get(tid);
+                    if (!state) {
+                        state = { map: new Map() };
+                        foreverLoops.set(tid, state);
+                    }
+                    state.map.set(id, { fn, worker: null, url: null, accumulator: 0, intervalId: null, _stopMainLoop: null });
 
-                await engine.doString(`
-            __luaHatRegistry = __luaHatRegistry or {}
-            __luaHatNextId = __luaHatNextId or 0
+                    const STEP = 1 / 240;
+                    const MAX_SUBSTEPS = 1000;
 
-            local function deep_contains_value(tbl, val, seen)
-                if seen == nil then seen = {} end
-                if type(tbl) ~= 'table' then return tbl == val end
-                if seen[tbl] then return false end
-                seen[tbl] = true
-                for k, v in pairs(tbl) do
-                    if type(v) == 'table' then
-                        if deep_contains_value(v, val, seen) then return true end
-                    else
-                        if v == val then return true end
-                    end
-                end
-                return false
-            end
+                    const processTick = (dt) => {
+                        try {
+                            const entry = state.map.get(id);
+                            if (!entry) return;
+                            entry.accumulator = entry.accumulator || 0;
+                            entry.accumulator += Math.max(0, Number(dt) || 0);
 
-            function on(hat, ...)
-                if type(hat) ~= 'string' and type(hat) ~= 'number' then
-                    if type(js_print) == 'function' then js_print('lua on() expected hat string/number, got '..tostring(type(hat))) end
-                    return function() end
-                end
-                local args = {...}
-                if #args == 0 then
-                    if type(js_print) == 'function' then js_print('lua on() expected function as last argument') end
-                    return function() end
-                end
-                local last = args[#args]
-                if type(last) ~= 'function' then
-                    if type(js_print) == 'function' then js_print('lua on() expected function as last argument, got '..tostring(type(last))) end
-                    return function() end
-                end
-                local fn = last
-                local matchers = nil
-                if #args > 1 then
-                    matchers = {}
-                    for i = 1, #args - 1 do table.insert(matchers, args[i]) end
-                end
+                            let fullSteps = Math.floor(entry.accumulator / STEP);
+                            if (fullSteps > MAX_SUBSTEPS) fullSteps = MAX_SUBSTEPS;
+                            // Diagnostic: record large batch drains or long accumulators
+                            try {
+                                if (window.jsEngine && window.jsEngine._pushDiag && (fullSteps > 20 || entry.accumulator > STEP * 10)) {
+                                    window.jsEngine._pushDiag({ tid: String(tid), op: 'batch_fixed', id, fullSteps, accumulator: entry.accumulator });
+                                }
+                            } catch(_) {}
 
-                hat = tostring(hat)
-                __luaHatRegistry[hat] = __luaHatRegistry[hat] or {}
-                __luaHatNextId = (__luaHatNextId or 0) + 1
-                local id = tostring(__luaHatNextId)
-                table.insert(__luaHatRegistry[hat], { id = id, fn = fn, matchers = matchers })
-                if type(__register_hat_in_js) == 'function' then pcall(__register_hat_in_js, hat, 1) end
+                            // Use batching + time-budget to avoid blocking the main thread
+                            const BATCH_STEPS = (window.jsEngine && Number.isFinite(window.jsEngine.foreverBatchSteps)) ? Number(window.jsEngine.foreverBatchSteps) : 120;
+                            const TIME_BUDGET_MS = (window.jsEngine && Number.isFinite(window.jsEngine.foreverTimeBudgetMs)) ? Number(window.jsEngine.foreverTimeBudgetMs) : 4;
 
-                return function()
-                    local list = __luaHatRegistry[hat] or {}
-                    for i = #list, 1, -1 do
-                        local entry = list[i]
-                        if type(entry) == 'table' and tostring(entry.id) == id then
-                            table.remove(list, i)
-                            if type(__register_hat_in_js) == 'function' then pcall(__register_hat_in_js, hat, -1) end
-                        end
-                    end
-                end
-            end
+                            const processBatch = (stepsToRun) => {
+                                const t0 = performance.now();
+                                let ran = 0;
+                                while (ran < stepsToRun) {
+                                    try {
+                                        const res = fn(STEP);
+                                        if (res && typeof res.then === 'function') res.catch(e => console.error(`[jsEngine] forever fn error for ${tid}:`, e));
+                                    } catch (e) {
+                                        console.error(`[jsEngine] forever fn error for ${tid}:`, e);
+                                    }
+                                    entry.accumulator -= STEP;
+                                    ran++;
+                                    if (performance.now() - t0 > TIME_BUDGET_MS) break;
+                                }
+                                return { ran, time: performance.now() - t0 };
+                            };
 
-            -- Forever function: run a Lua function every animation frame via JS
-            function forever(fn)
-                if type(fn) ~= 'function' then
-                    if type(js_print) == 'function' then js_print('lua forever() expected function') end
-                    return function() end
-                end
-                if type(__register_forever_in_js) == 'function' then
-                    local ok, cancel = pcall(__register_forever_in_js, fn)
-                    if ok and type(cancel) == 'function' then
-                        return cancel
-                    end
-                end
-                return function() end
-            end
+                            const runBatches = (remaining) => {
+                                if (remaining <= 0) return;
+                                const toRun = Math.min(remaining, BATCH_STEPS);
+                                const result = processBatch(toRun);
+                                remaining -= result.ran;
+                                if (remaining > 0 && remaining <= MAX_SUBSTEPS) {
+                                    setTimeout(() => runBatches(remaining), 0);
+                                }
+                            };
 
-            function __call_hats(hat, opts) 
-                hat = tostring(hat)
-                
-                -- Helper to safely get length of either table or userdata array
-                local function safe_len(arr)
-                    if arr == nil then return 0 end
-                    local ok, len = pcall(function() return #arr end)
-                    return ok and len or 0
-                end
-                
-                local ok, snapshot_or_err = pcall(function()
-                    local list = __luaHatRegistry[hat] or {}
-                    local snapshot = {}
-                    for i = 1, #list do
-                        local entry = list[i]
-                        if type(entry) == 'table' and type(entry.fn) == 'function' then
-                            table.insert(snapshot, entry)
-                        elseif type(entry) == 'function' then
-                            table.insert(snapshot, { fn = entry })
-                        end
-                    end
-                    return snapshot
-                end)
+                            if (fullSteps > 0) runBatches(fullSteps);
 
-                if not ok then
-                    if type(js_print) == 'function' then js_print('lua __call_hats snapshot failed: '..tostring(snapshot_or_err)) end
-                    return
-                end
+                            // fractional leftover (schedule immediately)
+                            if (entry.accumulator > 0) {
+                                const rem = Math.min(entry.accumulator, STEP);
+                                try {
+                                    const res = fn(rem);
+                                    if (res && typeof res.then === 'function') res.catch(e => console.error(`[jsEngine] forever fn error for ${tid}:`, e));
+                                } catch (e) {
+                                    console.error(`[jsEngine] forever fn error for ${tid}:`, e);
+                                }
+                                entry.accumulator -= rem;
+                                if (entry.accumulator < 0) entry.accumulator = 0;
+                            }
+                        } catch (_) {}
+                    };
 
-                local snapshot = snapshot_or_err
-                if #snapshot == 0 then
-                    return
-                end
+                    if (window.jsEngine && window.jsEngine.useForeverWorkers === false) {
+                        try {
+                            const entry = state.map.get(id);
+                            let last = performance.now();
+                            let running = true;
+                            const tick = () => {
+                                if (!running) return;
+                                try {
+                                    const now = performance.now();
+                                    let dt = (now - last) / 1000;
+                                    if (!isFinite(dt) || dt <= 0) dt = 0;
+                                    if (dt > 0.1) dt = 0.1;
+                                    last = now;
+                                    processTick(dt);
+                                } catch (_) {}
+                            };
+                            // Use recursive setTimeout to avoid overlapping handlers when tick takes longer than interval
+                            entry.intervalId = null;
+                            const scheduleMainTick = () => {
+                                if (!running) return;
+                                const start = performance.now();
+                                try { tick(); } catch (_) {}
+                                const elapsed = performance.now() - start;
+                                // record if tick cost exceeded interval (diagnostic)
+                                try {
+                                    if (window.jsEngine && window.jsEngine._pushDiag && elapsed > Math.max(1, intervalMs)) {
+                                        window.jsEngine._pushDiag({ tid: String(tid), op: 'long_tick', id, elapsed });
+                                    }
+                                } catch(_) {}
+                                // schedule next tick after interval, yielding if we overshot
+                                entry.intervalId = setTimeout(scheduleMainTick, Math.max(0, intervalMs - elapsed));
+                            };
+                            entry.intervalId = setTimeout(scheduleMainTick, intervalMs);
+                            entry._stopMainLoop = () => { running = false; try { if (entry.intervalId) clearTimeout(entry.intervalId); } catch(_) {} };                        } catch (_) {}
+                    } else {
+                        const blob = new Blob([workerSrc], { type: 'application/javascript' });
+                        const url = URL.createObjectURL(blob);
+                        const worker = new Worker(url);
 
-                local function safe_call(entry, opts)
-                    local fn = entry.fn
-                    if entry.matchers and type(entry.matchers) == 'table' then
-                        local args_len = (opts and opts._args) and safe_len(opts._args) or 0
-                        -- Prefer strict positional matching if _args available (handle both table and userdata)
-                        if opts ~= nil and opts._args ~= nil and args_len >= #entry.matchers then
-                            for i = 1, #entry.matchers do
-                                local m = entry.matchers[i]
-                                local a = opts._args[i]
-                                if m == nil then
-                                    -- nil matcher always matches
-                                else
-                                    if type(a) == 'string' and type(m) == 'string' then
-                                        if string.lower(a) ~= string.lower(m) then return end
-                                    else
-                                        if tostring(a) ~= tostring(m) then return end
-                                    end
-                                end
-                            end
-                        elseif opts ~= nil and opts.key ~= nil and #entry.matchers == 1 then
-                            -- common case: key-pressed hat provides \`key\` field
-                            local m = entry.matchers[1]
-                            if type(opts.key) == 'string' and type(m) == 'string' then
-                                if string.lower(opts.key) ~= string.lower(m) then return end
-                            else
-                                if tostring(opts.key) ~= tostring(m) then return end
-                            end
-                        else
-                            for i = 1, #entry.matchers do
-                                local m = entry.matchers[i]
-                                if not deep_contains_value(opts, m) then
-                                    return -- skip this handler
-                                end
-                            end
-                        end
-                    end
+                        const entry = state.map.get(id);
+                        entry.worker = worker;
+                        entry.url = url;
 
-                    -- If we reach here, the handler matched; call it
-                    if type(xpcall) == 'function' and type(debug) == 'table' and type(debug.traceback) == 'function' then
-                        local ok2, err = xpcall(function() return fn(opts) end, function(e) return debug.traceback(tostring(e)) end)
-                        if not ok2 and type(js_print) == 'function' then js_print('lua hat error: '..tostring(err)) end
-                    else
-                        local ok2, err = pcall(fn, opts)
-                        if not ok2 and type(js_print) == 'function' then js_print('lua hat error: '..tostring(err)) end
-                    end
-                end
+                        worker.onmessage = (ev) => {
+                            try {
+                                const data = ev.data;
+                                if (!data || data.cmd !== 'tick') return;
+                                let dt = Math.max(0, Number(data.dt) || 0);
+                                processTick(dt);
+                            } catch(_) {}
+                        };
+                    }
 
-                for i = 1, #snapshot do
-                    pcall(safe_call, snapshot[i], opts)
-                end
-            end
+                    const cancel = () => {
+                        try {
+                            const s = foreverLoops.get(tid);
+                            if (!s) return;
+                            const entry = s.map.get(id);
+                            if (!entry) return;
+                            try { if (entry._stopMainLoop) entry._stopMainLoop(); } catch (_) {}
+                            try { if (entry.intervalId) clearInterval(entry.intervalId); } catch (_) {}
+                            try { if (entry.worker) entry.worker.postMessage({ cmd: 'stop' }); } catch (_) {}
+                            try { if (entry.worker) entry.worker.terminate(); } catch (_) {}
+                            try { if (entry.url) URL.revokeObjectURL(entry.url); } catch (_) {}
+                            s.map.delete(id);
+                            if (s.map.size === 0) {
+                                foreverLoops.delete(tid);
+                            }
+                        } catch (_) {}
+                    };
 
-            function __dump_registry_types()
-                local out = {}
-                for k, v in pairs(__luaHatRegistry or {}) do
-                    for i = 1, #v do
-                        local entry = v[i]
-                        if type(entry) == 'table' then
-                            table.insert(out, tostring(k)..":"..tostring(i)..":table(id="..tostring(entry.id)..",fn="..tostring(type(entry.fn))..")")
-                        else
-                            table.insert(out, tostring(k)..":"..tostring(i)..":"..tostring(type(entry)))
-                        end
-                    end
-                end
-                return table.concat(out, ",")
-            end
-        `);
+                    return cancel;
+                } catch (e) {
+                    console.error('register_forever_fixed_in_js failed:', e);
+                    return () => {};
+                }
+            });
+        } catch (_) {}
 
-        await engine.doString(`function print(s) js_print(s) end`);
+        // JS helper: shallow identity (js_table_from_js replacement)
+        await engine.global.set('js_table_from_js', (tbl)=>tbl);
+
+                // removed legacy hat/forever helpers; implemented in per-target JS engine instead
+
+            // deep_contains_value removed; hat/handler matching implemented in JS
+
+            // on(hat, ...) is implemented in the per-target JS engine now
+
+            // forever(fn) implemented in per-target JS engine
+
+            // foreverFixed(fn, fps) implemented in per-target JS engine
+
+            // __call_hats moved to per-target JS engine implementation
+
+            // __dump_registry_types handled by JS diagnostics
+
+
+        try {
+            await engine.global.set('print', (...args) => { try { console.log(`[js:${tid}]`, ...args); } catch(_) {} });
+        } catch (_) {}
 
         if (loadedBlocksFull) {
             try {
                 await engine.global.set("blocks", loadedBlocksFull);
             } catch (_) {}
-            await injectOpcodeWrappersIntoLua(engine, loadedBlocksFull);
         }
 
         try {
-            const saved = storageGet("lua", tid);
+            const saved = storageGet("js", tid);
             if (saved) await engine.global.set("__saved_script", saved);
         } catch (_) {}
 
@@ -664,7 +1231,7 @@
         }
         let canSetGlobal = true;
         try {
-            const maybe = engine.global.set("__lua_hat_test_set", {});
+            const maybe = engine.global.set("__hat_test_set", {});
             if (maybe && typeof maybe.then === "function") {
                 await maybe.catch(() => {
                     canSetGlobal = false;
@@ -675,47 +1242,36 @@
         }
 
         const info = { engine, target, async: isAsync, canSetGlobal };
-        luaEngines.set(tid, info);
+        jsEngines.set(tid, info);
         return info;
     }
 
     // loadStdlibOnce removed (not used)
 
-    async function injectOpcodeWrappersIntoLua(infoOrEngine, blocksMap) {
+    async function injectOpcodeWrappersIntoEngine(infoOrEngine, blocksMap) {
         const engine = infoOrEngine.engine || infoOrEngine;
-        function sanitizeLuaName(s) {
+        function sanitizeName(s) {
             const keywords = new Set([
-                "and",
-                "break",
-                "do",
-                "else",
-                "elseif",
-                "end",
-                "false",
-                "for",
-                "function",
-                "goto",
-                "if",
-                "in",
-                "local",
-                "nil",
-                "not",
-                "or",
-                "repeat",
-                "return",
-                "then",
-                "true",
-                "until",
-                "while",
+                "break","case","catch","class","const","continue","debugger","default","delete",
+                "do","else","export","extends","finally","for","function","if","import","in",
+                "instanceof","let","new","return","switch","this","throw","try","typeof","var","void",
+                "while","with","yield","await","null","true","false","undefined"
             ]);
             let name = String(s).replace(/[^A-Za-z0-9_]/g, "_");
-            if (!name || keywords.has(name)) name = "op_" + name;
+            if (!name || keywords.has(name) || /^[0-9]/.test(name)) name = "op_" + name;
             return name;
         }
 
-        let src = "-- auto-generated opcode wrappers\n";
+        const lines = ["// auto-generated opcode wrappers"];
         for (const [opcode, entry] of Object.entries(blocksMap)) {
-            const argNames = extractArgNamesFromEntry(entry) || [];
+            let argNames = extractArgNamesFromEntry(entry) || [];
+            // fallback to global processed blocks if this entry had no arg names
+            try {
+                if ((!argNames || argNames.length === 0) && typeof loadedBlocksFull === 'object' && loadedBlocksFull && loadedBlocksFull[opcode]) {
+                    argNames = extractArgNamesFromEntry(loadedBlocksFull[opcode]) || argNames;
+                }
+            } catch (_) {}
+
             let cat = "misc",
                 method = opcode;
             const u = opcode.indexOf("_"),
@@ -727,34 +1283,257 @@
                 cat = opcode.slice(0, d);
                 method = opcode.slice(d + 1);
             }
-            const safeCat = sanitizeLuaName(cat);
-            const safeMethod = sanitizeLuaName(method);
-            const safeGlobal = sanitizeLuaName(opcode);
+            const safeCat = sanitizeName(cat);
+            const safeMethod = sanitizeName(method);
+            const safeGlobal = sanitizeName(opcode);
 
-            src += `if _G["${safeCat}"] == nil then ${safeCat} = {} end\n`;
-            src += `${safeCat}.${safeMethod} = function(...)\n  local p={...}\n  local args={}\n`;
+            lines.push(`if (typeof globalThis["${safeCat}"] === "undefined") globalThis["${safeCat}"] = {};`);
+            lines.push(`globalThis["${safeCat}"]["${safeMethod}"] = function(...p) {`);
+            lines.push(`  const args = {};`);
+            // defs may be present on the local entry or on the shared `blocks` object; use `blocks` at runtime
+            lines.push(`  const _defs = (typeof blocks === 'object' && blocks && Array.isArray(blocks[${JSON.stringify(opcode)}]) && Array.isArray(blocks[${JSON.stringify(opcode)}][0])) ? blocks[${JSON.stringify(opcode)}][0] : [];`);
             if (argNames.length) {
                 for (let i = 0; i < argNames.length; i++) {
                     const a = String(argNames[i]).replace(/"/g, '\\"');
-                    src += `  if #p >= ${i + 1} then args["${a}"] = p[${
-                        i + 1
-                    }] end\n`;
+                    lines.push(`  if (p.length >= ${i + 1}) {`);
+                    lines.push(`    try {`);
+                    lines.push(`      const _def = (_defs && _defs[${i}]) || null;`);
+                    lines.push(`      let _val = p[${i}];`);
+                    // coerce numeric-like args when type===1
+                    lines.push(`      if (_def && _def.type === 1) { const _n = Number(_val); _val = Number.isFinite(_n) ? _n : _val; }`);
+                    lines.push(`      args["${a}"] = _val;`);
+                    lines.push(`    } catch(_) { args["${a}"] = p[${i}]; }`);
+                    lines.push(`  }`);
                 }
             } else {
-                src += `  for i=1,#p do args["ARG"..i] = p[i] end\n`;
+                lines.push(`  for (let i=0;i<p.length;i++) args["ARG"+(i+1)] = p[i];`);
             }
+            // instrumentation to help debug calls
+            lines.push(`  try{ window.jsEngine = window.jsEngine || {}; window.jsEngine._lastWrapperCalls = window.jsEngine._lastWrapperCalls || []; window.jsEngine._lastWrapperCalls.push({opcode: "${opcode}", args: Object.assign({}, args)}); } catch(_) {}`);
             const escaped = opcode.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-            src += `  return call("${escaped}", args)\nend\n`;
+            lines.push(`  return call("${escaped}", args);`);
+            lines.push(`};`);
             src += `function ${safeGlobal}(...)\n  return ${safeCat}.${safeMethod}(...)\nend\n`;
-            src += `_G["${escaped}"] = ${safeCat}.${safeMethod}\n`;
-            src += `_G["${safeCat}.${safeMethod}"] = ${safeCat}.${safeMethod}\n\n`;
+            lines.push(`globalThis["${escaped}"] = globalThis["${safeCat}"]["${safeMethod}"];`);
+            lines.push(`globalThis["${safeCat}.${safeMethod}"] = globalThis["${safeCat}"]["${safeMethod}"];`);
+            lines.push(`globalThis["${safeGlobal}"] = globalThis["${safeCat}"]["${safeMethod}"];`);
+            lines.push("");
         }
 
         try {
+            // Generated source is JS-only; build and execute it
+            const src = lines.join("\n") + "\n";
             await engine.doString(src);
         } catch (e) {
-            console.error("injectOpcodeWrappersIntoLua failed:", e);
+            console.error("injectOpcodeWrappersIntoEngine failed:", e);
         }
+    }
+
+    // Full JS implementation (refactored) - ensures only JS emitted
+    async function injectOpcodeWrappersIntoEngine_refactored(infoOrEngine, blocksMap) {
+        const engine = infoOrEngine.engine || infoOrEngine;
+
+        function sanitizeName(s) {
+            const keywords = new Set([
+                "break","case","catch","class","const","continue","debugger","default","delete",
+                "do","else","export","extends","finally","for","function","if","import","in",
+                "instanceof","let","new","return","switch","this","throw","try","typeof","var","void",
+                "while","with","yield","await","null","true","false","undefined"
+            ]);
+            let name = String(s).replace(/[^A-Za-z0-9_]/g, "_");
+            if (!name || keywords.has(name) || /^[0-9]/.test(name)) name = "op_" + name;
+            return name;
+        }
+
+        const lines = ["// auto-generated opcode wrappers"];
+
+        for (const [opcode, entry] of Object.entries(blocksMap)) {
+            let argNames = extractArgNamesFromEntry(entry) || [];
+            // fallback to global processed blocks if this entry had no arg names
+            try {
+                if ((!argNames || argNames.length === 0) && typeof loadedBlocksFull === 'object' && loadedBlocksFull && loadedBlocksFull[opcode]) {
+                    argNames = extractArgNamesFromEntry(loadedBlocksFull[opcode]) || argNames;
+                }
+            } catch (_) {}
+
+            let cat = "misc";
+            let method = opcode;
+            const u = opcode.indexOf("_");
+            const d = opcode.indexOf(".");
+            if (u !== -1) {
+                cat = opcode.slice(0, u);
+                method = opcode.slice(u + 1);
+            } else if (d !== -1) {
+                cat = opcode.slice(0, d);
+                method = opcode.slice(d + 1);
+            }
+            const safeCat = sanitizeName(cat);
+            const safeMethod = sanitizeName(method);
+            const safeGlobal = sanitizeName(opcode);
+            const escaped = opcode.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+
+            lines.push(`if (typeof globalThis["${safeCat}"] === "undefined") globalThis["${safeCat}"] = {};`);
+            lines.push(`globalThis["${safeCat}"]["${safeMethod}"] = function(...p) {`);
+            lines.push(`  const args = {};`);
+            lines.push(`  const _defs = (typeof blocks === 'object' && blocks && Array.isArray(blocks[${JSON.stringify(opcode)}]) && Array.isArray(blocks[${JSON.stringify(opcode)}][0])) ? blocks[${JSON.stringify(opcode)}][0] : [];`);
+
+            if (argNames.length) {
+                for (let i = 0; i < argNames.length; i++) {
+                    const a = String(argNames[i]).replace(/"/g, '\\"');
+                    lines.push(`  if (p.length >= ${i + 1}) {`);
+                    lines.push(`    try {`);
+                    lines.push(`      const _def = (_defs && _defs[${i}]) || null;`);
+                    lines.push(`      let _val = p[${i}];`);
+                    lines.push(`      if (_def && _def.type === 1) { const _n = Number(_val); _val = Number.isFinite(_n) ? _n : _val; }`);
+                    lines.push(`      args["${a}"] = _val;`);
+                    lines.push(`    } catch(_) { args["${a}"] = p[${i}]; }`);
+                    lines.push(`  }`);
+                }
+            } else {
+                lines.push(`  for (let i=0;i<p.length;i++) args["ARG"+(i+1)] = p[i];`);
+            }
+
+            lines.push(`  try{ window.jsEngine = window.jsEngine || {}; window.jsEngine._lastWrapperCalls = window.jsEngine._lastWrapperCalls || []; window.jsEngine._lastWrapperCalls.push({opcode: ${JSON.stringify(opcode)}, args: Object.assign({}, args)}); } catch(_) {}`);
+
+            lines.push(`  return call("${escaped}", args);`);
+            lines.push(`};`);
+
+            lines.push(`globalThis["${escaped}"] = globalThis["${safeCat}"]["${safeMethod}"];`);
+            lines.push(`globalThis["${safeCat}.${safeMethod}"] = globalThis["${safeCat}"]["${safeMethod}"];`);
+            lines.push(`globalThis["${safeGlobal}"] = globalThis["${safeCat}"]["${safeMethod}"];`);
+            lines.push("");
+        }
+
+        const src = lines.join("\n") + "\n";
+
+        try {
+            try { window.jsEngine = window.jsEngine || {}; window.jsEngine._lastGeneratedWrapperSource = src; } catch(_) {}
+            await engine.doString(src);
+        } catch (e) {
+            console.error("injectOpcodeWrappersIntoEngine failed (refactor):", e);
+        }
+    }
+
+    try { injectOpcodeWrappersIntoEngine = injectOpcodeWrappersIntoEngine_refactored; } catch(_) {}
+
+    // Create page-global opcode wrappers so users can call opcodes directly from the page (e.g., motion_movesteps(10)).
+    function createPageOpcodeWrappers(blocksMap) {
+        try {
+            if (!blocksMap || typeof blocksMap !== 'object') return;
+            window.jsEngine = window.jsEngine || {};
+            window.jsEngine._lastGeneratedPageWrappers = window.jsEngine._lastGeneratedPageWrappers || {};
+            for (const [opcode, entry] of Object.entries(blocksMap)) {
+                try {
+                    // derive arg names and defs (prefer local entry, fallback to loadedBlocksFull)
+                    let argNames = extractArgNamesFromEntry(entry) || [];
+                    let defs = Array.isArray(entry) && entry.length && Array.isArray(entry[0]) ? entry[0] : [];
+                    try {
+                        if ((!argNames || argNames.length === 0) && typeof loadedBlocksFull === 'object' && loadedBlocksFull && loadedBlocksFull[opcode]) {
+                            argNames = extractArgNamesFromEntry(loadedBlocksFull[opcode]) || argNames;
+                            defs = Array.isArray(loadedBlocksFull[opcode]) && loadedBlocksFull[opcode].length && Array.isArray(loadedBlocksFull[opcode][0]) ? loadedBlocksFull[opcode][0] : defs;
+                        }
+                    } catch(_) {}
+
+                    // derive naming
+                    let cat = 'misc', method = opcode;
+                    const u = opcode.indexOf('_');
+                    const d = opcode.indexOf('.');
+                    if (u !== -1) { cat = opcode.slice(0, u); method = opcode.slice(u+1); }
+                    else if (d !== -1) { cat = opcode.slice(0, d); method = opcode.slice(d+1); }
+                    const sanitizeName = (s) => String(s).replace(/[^A-Za-z0-9_]/g, '_') || 'op';
+                    const safeCat = sanitizeName(cat);
+                    const safeMethod = sanitizeName(method);
+                    const safeGlobal = sanitizeName(opcode);
+
+                    // ensure namespace
+                    if (typeof globalThis[safeCat] !== 'object' || globalThis[safeCat] === null) globalThis[safeCat] = {};
+
+                    // if already defined and appears to be ours, skip
+                    const existing = globalThis[safeCat][safeMethod];
+
+                    // build wrapper
+                    const wrapper = function(...p) {
+                        try {
+                            let args = {};
+                            // Accept either a single args-object or positional args
+                            if (p.length === 1 && p[0] && typeof p[0] === 'object' && !Array.isArray(p[0])) {
+                                args = Object.assign({}, p[0]);
+                            } else {
+                                args = {};
+                                for (let i = 0; i < (argNames && argNames.length ? argNames.length : p.length); i++) {
+                                    const n = argNames && argNames[i] ? argNames[i] : ('ARG' + (i+1));
+                                    let v = p[i];
+                                    try {
+                                        const def = defs && defs[i] ? defs[i] : null;
+                                        if (def && def.type === 1) {
+                                            const nval = Number(v);
+                                            v = Number.isFinite(nval) ? nval : v;
+                                        }
+                                    } catch(_) {}
+                                    if (typeof n === 'string') args[n] = v;
+                                }
+                            }
+
+                            // Coerce numeric types based on defs for any explicit keys
+                            try {
+                                if (defs && Array.isArray(defs)) {
+                                    for (let i = 0; i < defs.length; i++) {
+                                        const def = defs[i];
+                                        const name = (argNames && argNames[i]) ? argNames[i] : ('ARG' + (i+1));
+                                        if (def && def.type === 1 && Object.prototype.hasOwnProperty.call(args, name)) {
+                                            const nn = Number(args[name]);
+                                            if (Number.isFinite(nn)) args[name] = nn;
+                                        }
+                                    }
+                                }
+                            } catch(_) {}
+
+                            // Positional-to-named fallback: if caller passed positional args but named keys are missing, map them by index
+                            try {
+                                if ((argNames && argNames.length) && (!argNames.some(n => Object.prototype.hasOwnProperty.call(args, n)))) {
+                                    for (let i = 0; i < (argNames.length && p ? argNames.length : 0); i++) {
+                                        if (i >= (p ? p.length : 0)) break;
+                                        const name = argNames[i];
+                                        if (!Object.prototype.hasOwnProperty.call(args, name)) {
+                                            let v = p[i];
+                                            try {
+                                                const def = defs && defs[i] ? defs[i] : null;
+                                                if (def && def.type === 1) {
+                                                    const nval = Number(v);
+                                                    v = Number.isFinite(nval) ? nval : v;
+                                                }
+                                            } catch(_) {}
+                                            args[name] = v;
+                                        }
+                                    }
+                                }
+                            } catch(_) {}
+
+                            // Choose a sensible target: editingTarget, otherwise first non-stage target, else first target
+                            let targetObj = null;
+                            try {
+                                if (window.vm && window.vm.editingTarget) targetObj = window.vm.editingTarget;
+                                else if (window.vm && window.vm.runtime && Array.isArray(window.vm.runtime.targets)) {
+                                    targetObj = window.vm.runtime.targets.find(tt => !tt.isStage) || window.vm.runtime.targets[0] || null;
+                                }
+                            } catch(_) {}
+
+                            try { window.jsEngine._lastWrapperCalls = window.jsEngine._lastWrapperCalls || []; window.jsEngine._lastWrapperCalls.push({ opcode, args: Object.assign({}, args), target: targetObj && (targetObj.id ?? targetObj.spriteId ?? String(targetObj)) || null, t: performance.now() }); } catch(_) {}
+
+                            return window.jsEngine.testCall(opcode, args, targetObj);
+                        } catch (e) { console.error('[jsEngine] page wrapper call failed for', opcode, e); throw e; }
+                    };
+
+                    // attach
+                    try { globalThis[safeCat][safeMethod] = wrapper; } catch(_) {}
+                    try { globalThis[safeGlobal] = wrapper; } catch(_) {}
+                    try { globalThis[`${safeCat}.${safeMethod}`] = wrapper; } catch(_) {}
+                    try { globalThis[opcode] = wrapper; } catch(_) {}
+
+                    window.jsEngine._lastGeneratedPageWrappers[opcode] = { safeCat, safeMethod, safeGlobal, argNames, defs };
+                } catch(_) {}
+            }
+        } catch (e) { console.error('[jsEngine] createPageOpcodeWrappers failed:', e); }
     }
 
     // ---------------- run/persist script per target ----------------
@@ -763,7 +1542,7 @@
         const tid = target.id ?? target.spriteId ?? String(target);
         let info;
         try {
-            info = await initLuaForTarget(target);
+            info = await initEngineForTarget(target);
         } catch (e) {
                 console.error("runScriptForTarget init error:", e);
             return;
@@ -772,16 +1551,17 @@
         code =
             typeof code === "string" && code.trim()
                 ? code
-                : storageGet("lua", tid) || "";
+                : storageGet("js", tid) || "";
         if (!code) return;
-        storageSet("lua", code, tid);
+        storageSet("js", code, tid);
         try {
-            await engine.doString(code);
+            const wrapped = '(async function(){\n' + code + '\n})().catch(function(e){ console.error("[jsEngine:' + tid + '] runtime error:", e); throw e; });';
+            await engine.doString(wrapped);
         } catch (e) {
-                console.error(`[luaEngine:${tid}] runtime error:`, e);
+            console.error(`[jsEngine:${tid}] runtime error:`, e);
         }
         try {
-            const info = luaEngines.get(tid);
+            const info = jsEngines.get(tid);
             if (info) await syncEngineHatIndex(info);
         } catch (_) {}
     }
@@ -801,42 +1581,16 @@
         };
     }
 
-    function escapeLuaString(s) {
-        return String(s)
-            .replace(/\\/g, "\\\\")
-            .replace(/"/g, '\\"')
-            .replace(/\n/g, "\\n");
-    }
-    function toLuaLiteral(obj, depth = 0) {
-        if (depth > 6) return "{}";
-        if (obj === null || obj === undefined) return "nil";
-        const t = typeof obj;
-        if (t === "number") {
-            if (!isFinite(obj)) return "nil";
-            return String(obj);
+    function toJSLiteral(obj) {
+        try {
+            const s = sanitizeForJS(obj);
+            return JSON.stringify(s);
+        } catch (_) {
+            return "null";
         }
-        if (t === "boolean") return obj ? "true" : "false";
-        if (t === "string") return `"${escapeLuaString(obj)}"`;
-        if (Array.isArray(obj)) {
-            const parts = obj.map((v) => toLuaLiteral(v, depth + 1));
-            return `{${parts.join(",")}}`;
-        }
-        if (t === "object") {
-            const parts = [];
-            for (const k of Object.keys(obj)) {
-                const v = obj[k];
-                if (typeof v === "function" || typeof v === "symbol") continue;
-                const key = /^[A-Za-z_][A-Za-z0-9_]*$/.test(k)
-                    ? k
-                    : `["${escapeLuaString(k)}"]`;
-                parts.push(`${key} = ${toLuaLiteral(v, depth + 1)}`);
-            }
-            return `{${parts.join(",")}}`;
-        }
-        return "nil";
     }
 
-    function sanitizeForLua(obj, depth = 0, seen = new WeakSet()) {
+    function sanitizeForJS(obj, depth = 0, seen = new WeakSet()) {
         if (depth > 6) return null;
         if (obj === null || obj === undefined) return null;
         const t = typeof obj;
@@ -847,7 +1601,7 @@
             seen.add(obj);
             const arr = [];
             for (const v of obj) {
-                const s = sanitizeForLua(v, depth + 1, seen);
+                const s = sanitizeForJS(v, depth + 1, seen);
                 arr.push(s === undefined ? null : s);
             }
             return arr;
@@ -860,7 +1614,7 @@
                     const v = obj[k];
                     if (typeof v === "function" || typeof v === "symbol")
                         continue;
-                    const s = sanitizeForLua(v, depth + 1, seen);
+                    const s = sanitizeForJS(v, depth + 1, seen);
                     if (s !== null && s !== undefined) out[k] = s;
                 } catch (_) {}
             }
@@ -886,10 +1640,10 @@
             const optsObj = Object.assign({}, options || {});
             try {
                 // Pass full target as a sanitized structured clone (no methods/functions,
-                // cycles trimmed) so Lua receives a deep copy it cannot mutate back in JS.
+                // cycles trimmed) so the engine receives a deep copy it cannot mutate back in JS.
                 let sanitizedTarget = null;
                 try {
-                    sanitizedTarget = sanitizeForLua(target);
+                    sanitizedTarget = sanitizeForJS(target);
                 } catch (_) {
                     sanitizedTarget = null;
                 }
@@ -912,7 +1666,7 @@
                 optsObj.target = targetClone;
             } catch (_) {}
 
-            const sanitizedOpts = sanitizeForLua(optsObj);
+            const sanitizedOpts = sanitizeForJS(optsObj);
 
             if (info && info.async === false && !forceRun) {
                 const q = queuedHats.get(tid) || [];
@@ -921,34 +1675,34 @@
                 return;
             }
 
-            let luaOpts = null;
+            let engineOpts = null;
             try {
-                const conv = await engine.global.get("lua_table_from_js");
+                const conv = await engine.global.get("js_table_from_js");
                 if (conv) {
                     const convPromise = conv(sanitizedOpts);
                     const timeout = new Promise((_, reject) =>
                         setTimeout(() => reject(new Error("conv timeout")), 200)
                     );
                     try {
-                        luaOpts = await Promise.race([convPromise, timeout]);
+                        engineOpts = await Promise.race([convPromise, timeout]);
                     } catch (_) {
-                        luaOpts = null;
+                        engineOpts = null;
                     }
                 }
             } catch (_) {
-                luaOpts = null;
+                engineOpts = null;
             }
 
-            //log(`[luaEngine] dispatching hat ${hatOpcode} to ${tid}`);
+            //log(`[jsEngine] dispatching hat ${hatOpcode} to ${tid}`);
 
             let usedLiteralFallback = false;
             try {
                 // Try to set full options into engine globals. If that's not possible,
-                // fall back to injecting a Lua literal for the full sanitized options.
+                // fall back to injecting a JS literal for the full sanitized options.
                 let setRes;
-                const toSet = luaOpts == null ? sanitizedOpts || {} : luaOpts;
+                const toSet = engineOpts == null ? sanitizedOpts || {} : engineOpts;
 
-                // Ensure positional args and key are present for Lua matcher logic.
+                // Ensure positional args and key are present for matcher logic.
                 try {
                     if (!toSet._args || !Array.isArray(toSet._args)) {
                         if (sanitizedOpts && Array.isArray(sanitizedOpts._args)) toSet._args = sanitizedOpts._args.slice();
@@ -969,16 +1723,16 @@
                     if (info && info.canSetGlobal === false) {
                         throw new Error("engine cannot set globals");
                     }
-                    setRes = engine.global.set("__lua_hat_opts", toSet);
+                    setRes = engine.global.set("__hat_opts", toSet);
                 } catch (err) {
                     // fallback to literal assignment of the full options
                     try {
-                        const literal = toLuaLiteral(toSet);
+                        const literal = toJSLiteral(toSet);
                         usedLiteralFallback = true;
-                        const fallback = engine.doString(`__lua_hat_opts = ${literal}`);
+                        const fallback = engine.doString(`__hat_opts = ${literal}`);
                         if (fallback && typeof fallback.catch === "function") fallback.catch(() => {});
                     } catch (e) {
-                        console.error(`[luaEngine] fallback __lua_hat_opts set failed for ${tid}:`, e);
+                        console.error(`[jsEngine] fallback __hat_opts set failed for ${tid}:`, e);
                     }
                     setRes = undefined;
                 }
@@ -987,20 +1741,20 @@
                     setRes.catch((e) => console.error(`engine.global.set failed for ${tid}:`, e));
                 }
             } catch (setErr) {
-                console.error(`[luaEngine] engine.global.set attempt failed for ${tid}:`, setErr);
+                console.error(`[jsEngine] engine.global.set attempt failed for ${tid}:`, setErr);
             }
 
             try {
                 if (usedLiteralFallback) {
-                    //log(`[luaEngine] calling __call_hats via doString for ${tid} (literal fallback used)`);
+                    //log(`[jsEngine] calling __call_hats via doString for ${tid} (literal fallback used)`);
                     const callRes = engine.doString(
                         `__call_hats(${JSON.stringify(
                             hatOpcode
-                        )}, __lua_hat_opts)`
+                        )}, __hat_opts)`
                     );
                     if (callRes && typeof callRes.catch === "function") {
                         callRes.catch(async (e) => {
-                            console.error(`[luaEngine] __call_hats failed for ${tid}:`, e);
+                            console.error(`[jsEngine] __call_hats failed for ${tid}:`, e);
                         });
                     }
                 } else {
@@ -1014,12 +1768,12 @@
                         try {
                             const res = callFn(
                                 hatOpcode,
-                                luaOpts == null ? {} : luaOpts
+                                engineOpts == null ? {} : engineOpts
                             );
                             if (res && typeof res.catch === "function") {
                                 res.catch(async (e) => {
                                     console.error(
-                                        `[luaEngine] __call_hats failed for ${tid}:`,
+                                        `[jsEngine] __call_hats failed for ${tid}:`, 
                                         e
                                     );
                                 });
@@ -1028,7 +1782,7 @@
                             const fallback = engine.doString(
                                 `__call_hats(${JSON.stringify(
                                     hatOpcode
-                                )}, __lua_hat_opts)`
+                                )}, __hat_opts)`
                             );
                             if (
                                 fallback &&
@@ -1036,7 +1790,7 @@
                             ) {
                                 fallback.catch((e) =>
                                     console.error(
-                                        `[luaEngine] __call_hats fallback failed for ${tid}:`,
+                                        `[jsEngine] __call_hats fallback failed for ${tid}:`,
                                         e
                                     )
                                 );
@@ -1046,12 +1800,12 @@
                         const callRes = engine.doString(
                             `__call_hats(${JSON.stringify(
                                 hatOpcode
-                            )}, __lua_hat_opts)`
+                            )}, __hat_opts)`
                         );
                         if (callRes && typeof callRes.catch === "function") {
                             callRes.catch(async (e) => {
                                 console.error(
-                                    `[luaEngine] __call_hats failed for ${tid}:`,
+                                    `[jsEngine] __call_hats failed for ${tid}:`, 
                                     e
                                 );
                             });
@@ -1059,7 +1813,7 @@
                     }
                 }
             } catch (e) {
-                console.error(`[luaEngine] __call_hats invocation error for ${tid}:`, e);
+                console.error(`[jsEngine] __call_hats invocation error for ${tid}:`, e);
             }
         } catch (e) {
             console.error("dispatchToEngine error:", e);
@@ -1229,15 +1983,15 @@
                         if (!t || !t.id) continue;
 
                         const tid = t.id ?? t.spriteId ?? String(t);
-                        let info = luaEngines.get(tid);
+                        let info = jsEngines.get(tid);
 
                         if (!info) {
-                            initLuaForTarget(t).catch((e) =>
-                                console.error(`initLuaForTarget(${tid}) failed:`, e)
+                            initEngineForTarget(t).catch((e) =>
+                                console.error(`initEngineForTarget(${tid}) failed:`, e)
                             );
 
                             setTimeout(() => {
-                                const info2 = luaEngines.get(tid);
+                                const info2 = jsEngines.get(tid);
                                 if (info2) {
                                     const constructed = buildHatOptions(hatOpcode, util, options);
                                     dispatchToEngine(info2, hatOpcode, constructed, t);
@@ -1256,7 +2010,7 @@
     }
 
     function patchStartHatsOnce(runtime) {
-        if (!runtime || runtime.__luaEngine_patchedStartHats) return;
+        if (!runtime || runtime.__jsEngine_patchedStartHats) return;
         const orig = runtime.startHats.bind(runtime);
         runtime.startHats = function (hatOpcode, util, options) {
             const res = orig(hatOpcode, util, options);
@@ -1265,13 +2019,16 @@
             } catch (_) {}
             return res;
         };
-        runtime.__luaEngine_patchedStartHats = true;
+        runtime.__jsEngine_patchedStartHats = true;
     }
 
     async function onProjectStart() {
         try {
             const b = buildProcessedBlocksFromToolbox();
-            if (Object.keys(b).length) loadedBlocksFull = b;
+            if (Object.keys(b).length) {
+                loadedBlocksFull = b;
+                try { createPageOpcodeWrappers(loadedBlocksFull); } catch(_) {}
+            }
 
             const runtime = window.vm?.runtime;
             if (!runtime) return;
@@ -1282,13 +2039,13 @@
                 try {
                     if (!t) continue;
                     const tid = t.id ?? String(t);
-                    const code = storageGet("lua", tid) || "";
+                    const code = storageGet("js", tid) || "";
                         if (code && code.trim())
                         runScriptForTarget(t, code).catch((e) =>
                             console.error("runScriptForTarget error:", e)
                         );
                     else {
-                        initLuaForTarget(t).catch(() => {});
+                        initEngineForTarget(t).catch(() => {});
                     }
                 } catch (_) {}
             }
@@ -1300,34 +2057,49 @@
     if (window.vm?.runtime && typeof window.vm.runtime.on === "function") {
         window.vm.runtime.on("PROJECT_START", onProjectStart);
         try { onProjectStart().catch(() => {}); } catch (_) {}
-        // register PROJECT_STOP_ALL to clear Lua listeners and attempt engine exits
+        // register PROJECT_STOP_ALL to clear JS listeners and attempt engine exits
         try {
             const stopHandler = async () => {
                 try {
-                    for (const [tid, info] of luaEngines) {
+                    for (const [tid, info] of jsEngines) {
                         try {
                                 if (info && info.engine) {
                                     try {
-                                        const p = info.engine.doString('__luaHatRegistry = {}');
-                                        if (p && typeof p.catch === 'function') p.catch(() => {});
+                                        if (info.engine._hatRegistry) info.engine._hatRegistry = {};
                                     } catch (_) {}
                                 }
                         } catch (_) {}
                         try { queuedHats.delete(tid); } catch (_) {}
+                        try { renderInterp.map.delete(tid); } catch (_) {}
                         try {
                             const s = foreverLoops.get(tid);
                             if (s) {
-                                try { if (s.rafId != null) cancelAnimationFrame(s.rafId); } catch (_) {}
+                                try {
+                                    for (const [id, entry] of s.map) {
+                                        try { if (entry.worker) { try { entry.worker.postMessage({ cmd: 'stop' }); } catch(_) {} entry.worker.terminate(); } } catch(_) {}
+                                        try { if (entry.url) URL.revokeObjectURL(entry.url); } catch(_) {}
+                                    }
+                                } catch(_) {}
                                 try { s.map.clear(); } catch (_) {}
                                 foreverLoops.delete(tid);
                             }
                         } catch (_) {}
                     }
                     try {
-                        if (window.luaEngine) {
+                        if (window.jsEngine) {
                             try { queuedHats.clear(); } catch (_) {}
-                            try { window.luaEngine._hatIndex = new Map(); } catch (_) {}
-                            try { for (const [tid,s] of foreverLoops) { try { if (s.rafId != null) cancelAnimationFrame(s.rafId); } catch(_) {} } foreverLoops.clear(); } catch(_) {}
+                            try { window.jsEngine._hatIndex = new Map(); } catch (_) {}
+                            try {
+                                for (const [tid,s] of foreverLoops) {
+                                    try {
+                                        for (const [id, entry] of s.map) {
+                                            try { if (entry.worker) { try { entry.worker.postMessage({ cmd: 'stop' }); } catch(_) {} entry.worker.terminate(); } } catch(_) {}
+                                            try { if (entry.url) URL.revokeObjectURL(entry.url); } catch(_) {}
+                                        }
+                                    } catch(_) {}
+                                }
+                                try { foreverLoops.clear(); } catch(_) {}
+                            } catch(_) {}
                         }
                     } catch (_) {}
                     // PROJECT_STOP_ALL cleanup finished
@@ -1351,27 +2123,36 @@
                     try {
                         const stopHandler = async () => {
                                 try {
-                                for (const [tid, info] of luaEngines) {
+                                for (const [tid, info] of jsEngines) {
                                     try {
                                         if (info && info.engine) {
                                             try {
-                                                const p = info.engine.doString('__luaHatRegistry = {}');
-                                                if (p && typeof p.catch === 'function') p.catch(() => {});
+                                                try { if (info.engine._hatRegistry) info.engine._hatRegistry = {}; } catch(_) {}
                                             } catch (_) {}
                                         }
                                     } catch (_) {}
                                     try { queuedHats.clear(); } catch (_) {}
-                                    try { const s = foreverLoops.get(tid); if (s) { try { if (s.rafId != null) cancelAnimationFrame(s.rafId); } catch(_) {} try { s.map.clear(); } catch(_) {} foreverLoops.delete(tid); } } catch (_) {}
+                                    try { const s = foreverLoops.get(tid); if (s) { try { for (const [id, entry] of s.map) { try { if (entry.worker) { try { entry.worker.postMessage({ cmd: 'stop' }); } catch(_) {} entry.worker.terminate(); } } catch(_) {} try { if (entry.url) URL.revokeObjectURL(entry.url); } catch(_) {} } } catch(_) {} try { s.map.clear(); } catch(_) {} foreverLoops.delete(tid); } } catch (_) {}
                                 }
                                 try {
-                                    const map = window.luaEngine && window.luaEngine._hatIndex;
+                                    const map = window.jsEngine && window.jsEngine._hatIndex;
                                     if (map && map instanceof Map) {
                                         for (const [hat, m] of map) {
                                                     try {} catch (_) {}
                                         }
                                     }
                                 } catch (_) {}
-                                try { for (const [tid,s] of foreverLoops) { try { if (s.rafId != null) cancelAnimationFrame(s.rafId); } catch(_) {} } foreverLoops.clear(); } catch(_) {}
+                                try {
+                                    for (const [tid,s] of foreverLoops) {
+                                        try {
+                                            for (const [id, entry] of s.map) {
+                                                try { if (entry.worker) { try { entry.worker.postMessage({ cmd: 'stop' }); } catch(_) {} entry.worker.terminate(); } } catch(_) {}
+                                                try { if (entry.url) URL.revokeObjectURL(entry.url); } catch(_) {}
+                                            }
+                                        } catch(_) {}
+                                    }
+                                    try { foreverLoops.clear(); } catch(_) {}
+                                } catch(_) {}
                                 // PROJECT_STOP_ALL cleanup finished
                             } catch (e) {
                                 console.error("PROJECT_STOP_ALL handler error:", e);
@@ -1394,13 +2175,13 @@
                         if (id && id !== last) {
                             last = id;
                             try {
-                                if (t) await initLuaForTarget(t).catch(() => {});
+                                if (t) await initEngineForTarget(t).catch(() => {});
                             } catch (_) {}
                             try {
                                 if (editor) {
-                                    let code = storageGet("lua", id) || "";
+                                    let code = storageGet("js", id) || "";
                                     try {
-                                        const info = luaEngines.get(id);
+                                        const info = jsEngines.get(id);
                                         if (info && info.engine) {
                                             const saved = await info.engine.global.get("__saved_script").catch(() => null);
                                             if (typeof saved === "string" && saved.length) code = saved;
@@ -1415,15 +2196,15 @@
             }, 150);
     })();
 
-    window.luaEngine = window.luaEngine || {};
-    window.luaEngine._queuedHats = queuedHats;
-    window.luaEngine._foreverLoops = foreverLoops;
-    window.luaEngine._hatIndex = window.luaEngine._hatIndex || new Map();
-    window.luaEngine._registerHatForEngine = function (tid, hat, delta) {
+    window.jsEngine = window.jsEngine || {};
+    window.jsEngine._queuedHats = queuedHats;
+    window.jsEngine._foreverLoops = foreverLoops;
+    window.jsEngine._hatIndex = window.jsEngine._hatIndex || new Map();
+    window.jsEngine._registerHatForEngine = function (tid, hat, delta) {
         try {
             if (!hat) return;
             const key = String(hat);
-            const map = window.luaEngine._hatIndex;
+            const map = window.jsEngine._hatIndex;
             let s = map.get(key);
             if (!s) {
                 if (delta <= 0) return;
@@ -1448,28 +2229,37 @@
             const engine = info.engine;
             let res = null;
             try {
-                const code = `local out={}; for k,v in pairs(__luaHatRegistry or {}) do out[k]=#v end; return out`;
-                res = await engine.doString(code);
+                const dumpFn = await engine.global.get('__dump_registry_types').catch(() => null);
+                if (dumpFn && typeof dumpFn === 'function') {
+                    res = await dumpFn();
+                } else if (engine._hatRegistry && typeof engine._hatRegistry === 'object') {
+                    res = {};
+                    for (const [hat, arr] of Object.entries(engine._hatRegistry)) {
+                        res[hat] = Array.isArray(arr) ? arr.length : (arr && typeof arr === 'object' ? Object.keys(arr).length : 0);
+                    }
+                } else {
+                    res = null;
+                }
             } catch (e) {
                 res = null;
             }
             if (!res || typeof res !== "object") return;
             for (const [hat, count] of Object.entries(res)) {
                 try {
-                    const prevMap = window.luaEngine._hatIndex.get(String(hat));
+                    const prevMap = window.jsEngine._hatIndex.get(String(hat));
                     const prev =
                         prevMap && prevMap.get(tid) ? prevMap.get(tid) : 0;
                     const delta = Number(count || 0) - Number(prev || 0);
                     if (delta !== 0)
-                        window.luaEngine._registerHatForEngine(tid, hat, delta);
+                        window.jsEngine._registerHatForEngine(tid, hat, delta);
                 } catch (_) {}
             }
         } catch (_) {}
     }
-    window.luaEngine.runQueuedHatsFor = function (tid, opts = {}) {
+    window.jsEngine.runQueuedHatsFor = function (tid, opts = {}) {
         const q = queuedHats.get(tid) || [];
         if (!q.length) return;
-        const info = luaEngines.get(tid);
+        const info = jsEngines.get(tid);
         if (!info) return;
         if (info.async === false && !opts.force) return;
         (function runNext() {
@@ -1493,49 +2283,60 @@
         })();
     };
 
-    window.luaEngine.hasHandlersForHat = function (hat) {
+    window.jsEngine.hasHandlersForHat = function (hat) {
         try {
-            const s = window.luaEngine._hatIndex.get(String(hat));
+            const s = window.jsEngine._hatIndex.get(String(hat));
             return !!(s && s.size > 0);
         } catch (_) {
             return false;
         }
     };
 
-    window.luaEngine.dumpRegistries = async function () {
+    window.jsEngine.dumpRegistries = async function () {
         try {
-            for (const [tid, info] of luaEngines) {
-                    try {
+            for (const [tid, info] of jsEngines) {
+                try {
                     const engine = info.engine;
-                    const dump = await engine.doString(
-                        "return __dump_registry_types()"
-                    );
+                    let dump = null;
+                    try {
+                        const fn = await engine.global.get('__dump_registry_types').catch(() => null);
+                        if (fn && typeof fn === 'function') {
+                            dump = await fn();
+                        } else if (engine._hatRegistry && typeof engine._hatRegistry === 'object') {
+                            dump = {};
+                            for (const [hat, arr] of Object.entries(engine._hatRegistry)) {
+                                dump[hat] = Array.isArray(arr) ? arr.length : (arr && typeof arr === 'object' ? Object.keys(arr).length : 0);
+                            }
+                        }
+                    } catch (e) {
+                        dump = null;
+                    }
                     // registry_types dump collected (ignored)
                 } catch (e) {
-                    console.error("[luaEngine] registry_types failed for", tid, e);
+                    console.error("[jsEngine] registry_types failed for", tid, e);
                 }
             }
         } catch (e) {
-            console.error("[luaEngine] dumpRegistries error:", e);
+            console.error("[jsEngine] dumpRegistries error:", e);
         }
     };
 
-    window.luaEngine.syncAllHatIndexes = async function () {
+    window.jsEngine.syncAllHatIndexes = async function () {
         try {
-            for (const [tid, info] of luaEngines) {
+            for (const [tid, info] of jsEngines) {
                 try {
                     await syncEngineHatIndex(info);
                 } catch (_) {}
             }
             // syncAllHatIndexes completed
         } catch (e) {
-            console.error("[luaEngine] syncAllHatIndexes error:", e);
+            console.error("[jsEngine] syncAllHatIndexes error:", e);
         }
     };
 
-    window.luaEngine.callHatOnEngine = async function (tid, hat) {
+    window.jsEngine.callHatOnEngine = async function (tid, hat) {
         try {
-            const info = luaEngines.get(tid);
+            const info = jsEngines.get(tid);
             if (!info) return;
             const engine = info.engine;
             try {
@@ -1544,56 +2345,57 @@
                 );
                 // callHatOnEngine result available (ignored)
             } catch (e) {
-                console.error("[luaEngine] callHatOnEngine failed for", tid, hat, e);
+                console.error("[jsEngine] callHatOnEngine failed for", tid, hat, e);
             }
         } catch (e) {
-            console.error("[luaEngine] callHatOnEngine error:", e);
+            console.error("[jsEngine] callHatOnEngine error:", e);
         }
     };
 
-    window.luaEngine.runFor = async function (tid, code) {
-        let info = luaEngines.get(tid);
+    window.jsEngine.runFor = async function (tid, code) {
+        let info = jsEngines.get(tid);
         if (!info) {
             try {
-                await initLuaForTarget({ id: tid, name: tid });
-                info = luaEngines.get(tid);
+                await initEngineForTarget({ id: tid, name: tid });
+                info = jsEngines.get(tid);
                 if (!info) {
-                    console.error(`[luaEngine] failed to initialize engine for ${tid}`);
+                    console.error(`[jsEngine] failed to initialize engine for ${tid}`);
                     return;
                 }
             } catch (e) {
-                console.error(`[luaEngine] failed to init engine for ${tid}:`, e);
+                console.error(`[jsEngine] failed to init engine for ${tid}:`, e);
                 return;
             }
         }
         try {
             if (typeof info.engine.doString === "function") {
-                await info.engine.doString(code);
+                const wrapped = '(async function(){\n' + code + '\n})().catch(function(e){ console.error("[jsEngine:' + tid + '] runtime error:", e); throw e; });';
+                await info.engine.doString(wrapped);
             } else if (typeof info.engine.run === "function") {
                 await info.engine.run(code);
             } else {
                 // engine has no doString/run
             }
         } catch (e) {
-            console.error(`[luaEngine] runFor(${tid}) error:`, e);
+            console.error(`[jsEngine] runFor(${tid}) error:`, e);
         }
     };
 
     (function (Scratch) {
-        class luaEngineExtension {
+        class jsEngineExtension {
             getInfo() {
-                return { id: "luaengine", name: "Lua Editor", blocks: [] };
+                return { id: "jsengine", name: "JS Editor", blocks: [] };
             }
-            async runLua(code) {
+            async runJS(code) {
                 const t = window.vm?.editingTarget;
                 if (!t) return null;
                 return runScriptForTarget(t, code);
             }
         }
         try {
-            Scratch.extensions.register(new luaEngineExtension());
+            Scratch.extensions.register(new jsEngineExtension());
         } catch (_) {}
     })(Scratch);
 
-    // luaEngine injected
+    // jsEngine injected
 })();
