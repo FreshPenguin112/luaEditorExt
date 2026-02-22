@@ -3,6 +3,7 @@
   let uiEnabled = !!container;
   try {
     window.jsEngine = window.jsEngine || {};
+    window.jsEngine.engines = new Map();
     window.jsEngine._sanitizeBailouts = window.jsEngine._sanitizeBailouts || 0;
     window.jsEngine.getSanitizeBailouts = function () {
       return window.jsEngine._sanitizeBailouts || 0;
@@ -723,7 +724,7 @@
       }
       return () => {};
     });
-
+    window.jsEngine.engines.set(tid, engine)
     return engine;
   }
   async function initEngineForTarget(target) {
