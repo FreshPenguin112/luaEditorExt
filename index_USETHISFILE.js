@@ -16,6 +16,7 @@
   const EXT_KEY = "jsengine";
   const _queuedStorage = {};
   const jsEngines = new Map();
+  
   const queuedHats = new Map();
   const foreverLoops = new Map();
   const renderInterp = {
@@ -632,6 +633,41 @@
     };
     await engine.global.set("js_table_from_js", (tbl) => tbl);
     await engine.global.set("print", (s) => console.log(`[js:${tid}]`, s));
+    await engine.global.set(
+      "targets",
+      new Proxy(
+        {},
+        {
+          get(_t, prop) {
+            try {
+              if (typeof prop !== "string") return undefined;
+              const rt = window.vm && window.vm.runtime;
+              const tlist = rt && rt.targets;
+              if (!tlist || typeof tlist.find !== "function") return undefined;
+              return tlist.find((t) => {
+                try {
+                  return t && t.sprite && t.sprite.name == prop;
+                } catch (_) {
+                  return false;
+                }
+              });
+            } catch (_) {
+              return undefined;
+            }
+          },
+          set(_t, _prop, _value) {
+            return true;
+          },
+          has(_t, prop) {
+            try {
+              return !!(this.get && this.get(_t, prop));
+            } catch (_) {
+              return false;
+            }
+          },
+        }
+      )
+    );
     await engine.global.set("on", (hat, ...args) => {
       try {
         const last = args[args.length - 1];
