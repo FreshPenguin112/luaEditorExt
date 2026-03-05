@@ -253,6 +253,7 @@
             { caption: "call(opcode, args)", value: "call(", meta: "stdlib" },
             { caption: "print(x)", value: "print(", meta: "stdlib" },
             { caption: "inspect_block_args(op)", value: "inspect_block_args(", meta: "stdlib" },
+            { caption: "targets.x", value: "targets.", meta: "stdlib"}
           ];
           const blockList = [];
           try {
